@@ -49,3 +49,31 @@ open-source spec in this project's issue tracker once published.
 | Task | Without squire (tokens) | With squire (tokens) | Saved |
 |---|---|---|---|
 | TBD | TBD | TBD | TBD |
+
+
+## Benchmarks (TBD)
+
+Here is the markdown table structure with the specified columns and placeholder rows:
+
+```markdown
+| Task               | Tokens without squire | Tokens with squire | Percent saved |
+|:------------------:|:---------------------:|:------------------:|:-------------:|
+| TBD                |           TBD         |          TBD        |      TBD      |
+| TBD                |           TBD         |          TBD        |      TBD      |
+| TBD                |           TBD         |          TBD        |      TBD      |
+```
+
+## Usage
+
+```bash
+squire run -- <command...>   # run a command; show its REAL exit code, raw tail, and a local summary of failures (short output is printed as-is, no model)
+squire sum [file|-]          # condense text to a few bullets
+squire ask "question" [file|-]   # answer a question from the given text only
+squire draft "instructions" [file|-]  # first draft for Claude to review
+```
+
+### Rules built in (global CLAUDE.md section 5.8):
+- Exit codes and the raw tail are ALWAYS printed. The model never decides pass or fail.
+- Model output is labelled [squire] and is ASSUMED until the session checks it.
+- Ollama down or erroring means the output says UNKNOWN and falls back to the raw tail, never silence.
+- Stdlib only: runs on any python3 on this machine.
