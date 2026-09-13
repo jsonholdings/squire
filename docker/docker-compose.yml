@@ -1,0 +1,86 @@
+# squire-stack: one-command `docker compose up` for squire + Ollama.
+#
+# GPU (default): requires nvidia-container-toolkit on the host. See README.md.
+# CPU-only fallback: `docker compose -f docker-compose.yml -f docker-compose.cpu.yml up`
+#
+# Everything binds to 127.0.0.1 only — no LAN/WAN exposure, matching squire's
+# localhost-only, no-telemetry design (see ../CLAUDE.md, ../squire.py header).
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: squire-stack-ollama
+    ports:
+      - "127.0.0.1:${SQUIRE_STACK_OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  model-pull:
+    image: ollama/ollama:latest
+    container_name: squire-stack-model-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: ollama:11434
+      SQUIRE_MODEL: ${SQUIRE_MODEL:-qwen2.5:14b}
+      SQUIRE_EMBED_MODEL: ${SQUIRE_EMBED_MODEL:-nomic-embed-text}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        ollama pull "$$SQUIRE_MODEL" &&
+        ollama pull "$$SQUIRE_EMBED_MODEL" &&
+        echo "model-pull: done"
+    restart: "no"
+
+  squire:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: squire-stack:latest
+    container_name: squire-stack-squire
+    depends_on:
+      ollama:
+        condition: service_healthy
+      model-pull:
+        condition: service_completed_successfully
+    environment:
+      SQUIRE_OLLAMA: http://ollama:11434
+      # squire refuses any backend host that isn't localhost/127.0.0.1/::1
+      # unless explicitly allow-listed; "ollama" is this compose network's
+      # service hostname, not a remote host.
+      SQUIRE_ALLOW_HOSTS: ollama
+      SQUIRE_MODEL: ${SQUIRE_MODEL:-qwen2.5:14b}
+      SQUIRE_EMBED_MODEL: ${SQUIRE_EMBED_MODEL:-nomic-embed-text}
+      SQUIRE_LEDGER: /data/ledger.jsonl
+    volumes:
+      - squire-data:/data
+    # No exposed ports: invoke with
+    #   docker compose run --rm squire run -- <command...>
+    #   docker compose run --rm squire sum <file>
+    #   docker compose run --rm squire doctor --json   # 0 ready, 2 UNKNOWN
+    healthcheck:
+      test: ["CMD", "python3", "/app/squire.py", "doctor", "--json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles: ["tools"]
+
+volumes:
+  ollama-models:
+  squire-data:

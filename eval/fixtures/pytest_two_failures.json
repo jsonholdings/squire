@@ -1,0 +1,7 @@
+{
+  "failures": [
+    {"test": "tests/test_parser.py::test_parser_handles_negative", "file": "tests/test_parser.py", "line": 88},
+    {"test": "tests/test_render.py::test_render_empty_template", "file": "tests/test_render.py", "line": 141}
+  ],
+  "clean": false
+}

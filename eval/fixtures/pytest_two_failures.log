@@ -1,0 +1,73 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.6, pytest-8.1.1, pluggy-1.4.0
+rootdir: /workspace/widget-app
+collected 42 items
+
+tests/test_math.py ....................                                [ 47%]
+tests/test_parser.py ..........F.......                                [ 90%]
+tests/test_render.py ....F                                             [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_parser_handles_negative __________________________
+
+    def test_parser_handles_negative():
+        result = parse_expr("-3 + 4")
+>       assert result == 1
+E       assert -7 == 1
+E        +  where -7 = parse_expr('-3 + 4')
+
+tests/test_parser.py:88: AssertionError
+
+_________________________ test_render_empty_template _____________________________
+
+    def test_render_empty_template():
+        out = render_template("")
+>       assert out == ""
+E       AssertionError: assert 'None' == ''
+
+tests/test_render.py:141: AssertionError
+
+filler line 1
+filler line 2
+filler line 3
+filler line 4
+filler line 5
+filler line 6
+filler line 7
+filler line 8
+filler line 9
+filler line 10
+filler line 11
+filler line 12
+filler line 13
+filler line 14
+filler line 15
+filler line 16
+filler line 17
+filler line 18
+filler line 19
+filler line 20
+filler line 21
+filler line 22
+filler line 23
+filler line 24
+filler line 25
+filler line 26
+filler line 27
+filler line 28
+filler line 29
+filler line 30
+filler line 31
+filler line 32
+filler line 33
+filler line 34
+filler line 35
+filler line 36
+filler line 37
+filler line 38
+filler line 39
+filler line 40
+=========================== short test summary info ============================
+FAILED tests/test_parser.py::test_parser_handles_negative - assert -7 == 1
+FAILED tests/test_render.py::test_render_empty_template - AssertionError
+========================= 2 failed, 40 passed in 3.21s ==========================

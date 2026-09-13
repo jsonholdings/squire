@@ -1,0 +1,12 @@
+# CPU-only override: drops the GPU device reservation for hosts without an
+# nvidia GPU / nvidia-container-toolkit. Ollama runs on CPU (slower).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices: []

@@ -1,0 +1,26 @@
+{
+  "_comment": "Example only -- not installed automatically. Merge the relevant pieces into your own ~/.claude/settings.json or a project .claude/settings.json.",
+  "mcpServers": {
+    "squire": {
+      "command": "python3",
+      "args": ["/path/to/squire/mcp/squire_mcp.py"],
+      "env": {
+        "SQUIRE_BIN": "/path/to/squire/squire.py"
+      }
+    }
+  },
+  "hooks": {
+    "_comment": "PreToolUse (pretool_wrap.py) is the recommended, token-saving hook: it rewrites noisy Bash commands to run through squire BEFORE execution, so only condensed output reaches the model. PostToolUse (posttool_condense.py) is opt-in only -- it can only ADD context on top of output already shown, which increases tokens; see the header comment in that file. Do not enable both on the same command class.",
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/squire/hooks/pretool_wrap.py"
+          }
+        ]
+      }
+    ]
+  }
+}

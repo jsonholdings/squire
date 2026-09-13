@@ -1,0 +1,6 @@
+{
+  "failures": [
+    {"test": "Button component > calls onClick handler when clicked", "file": "src/components/Button.test.js", "line": 23}
+  ],
+  "clean": false
+}

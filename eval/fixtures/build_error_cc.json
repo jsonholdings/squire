@@ -1,0 +1,7 @@
+{
+  "failures": [
+    {"test": "compile error: use of undeclared identifier 'new_capacity'", "file": "src/buffer.cpp", "line": 73},
+    {"test": "compile error: expected ';' before 'return'", "file": "src/buffer.cpp", "line": 81}
+  ],
+  "clean": false
+}

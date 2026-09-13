@@ -4,11 +4,49 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "squire-offload"
-version = "0.1.0.dev0"
-description = "Local sidekick for Claude Code: offload bulk text (test output, logs, drafts) to your own GPU via Ollama."
+version = "0.2.0"
+description = "Local sidekick for Claude Code: offload bulk text (test output, logs, diffs, search) to your own GPU."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
+# SPDX identifier pending the owner's choice (MIT or Apache-2.0) -- see SPEC-OPEN-SOURCE.md
+# "Open questions". scripts/scrub_check.py --release blocks a tagged release without a LICENSE
+# file; do not set this to a real license id until that decision is made.
+license = { text = "UNLICENSED (pending owner choice: MIT or Apache-2.0)" }
+authors = [
+    { name = "JSON Holdings" },
+]
+keywords = [
+    "claude-code",
+    "llm",
+    "ollama",
+    "local-inference",
+    "cli",
+    "token-savings",
+    "developer-tools",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+# Placeholders -- filled in when the JSON Holdings GitHub organization is created
+# (SPEC-OPEN-SOURCE.md "Decided"); do not invent a URL before then.
+Homepage = "https://github.com/PLACEHOLDER-ORG/squire"
+Repository = "https://github.com/PLACEHOLDER-ORG/squire"
+Issues = "https://github.com/PLACEHOLDER-ORG/squire/issues"
+Changelog = "https://github.com/PLACEHOLDER-ORG/squire/blob/main/CHANGELOG.md"
 
 [project.scripts]
 squire = "squire:main"

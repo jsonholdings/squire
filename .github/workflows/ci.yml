@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.9", "3.11", "3.12", "3.13"]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,3 +14,30 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest -q
       - run: python scripts/scrub_check.py
+      # The accuracy eval (eval/run_eval.py) needs a live local GPU backend and does NOT
+      # run here -- CI runners have no GPU and no Ollama. Run it locally before release.
+
+  package:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: Build zipapp
+        run: python scripts/build_zipapp.py
+      - name: Smoke-run --help from the wheel
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          /tmp/wheel-venv/bin/squire --help
+      - name: Smoke-run --help from the zipapp
+        run: python dist/squire.pyz --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: squire-dist
+          path: dist/

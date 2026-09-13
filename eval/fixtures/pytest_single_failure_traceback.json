@@ -1,0 +1,6 @@
+{
+  "failures": [
+    {"test": "tests/test_auth.py::test_token_expiry", "file": "tests/test_auth.py", "line": 203}
+  ],
+  "clean": false
+}

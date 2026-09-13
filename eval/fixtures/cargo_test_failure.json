@@ -1,0 +1,6 @@
+{
+  "failures": [
+    {"test": "math::tests::test_add_overflow", "file": "src/math.rs", "line": 57}
+  ],
+  "clean": false
+}

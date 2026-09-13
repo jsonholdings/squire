@@ -1,0 +1,69 @@
+PASS src/utils/format.test.js
+PASS src/utils/date.test.js
+FAIL src/components/Button.test.js
+  Button component
+    ✓ renders label (12 ms)
+    ✕ calls onClick handler when clicked (8 ms)
+
+  ● Button component › calls onClick handler when clicked
+
+    expect(jest.fn()).toHaveBeenCalledTimes(1)
+
+    Expected number of calls: 1
+    Received number of calls: 0
+
+      22 |   fireEvent.click(screen.getByRole('button'))
+      23 |   expect(handleClick).toHaveBeenCalledTimes(1)
+    > 24 | })
+         | ^
+
+      at src/components/Button.test.js:23:22
+
+filler line 1
+filler line 2
+filler line 3
+filler line 4
+filler line 5
+filler line 6
+filler line 7
+filler line 8
+filler line 9
+filler line 10
+filler line 11
+filler line 12
+filler line 13
+filler line 14
+filler line 15
+filler line 16
+filler line 17
+filler line 18
+filler line 19
+filler line 20
+filler line 21
+filler line 22
+filler line 23
+filler line 24
+filler line 25
+filler line 26
+filler line 27
+filler line 28
+filler line 29
+filler line 30
+filler line 31
+filler line 32
+filler line 33
+filler line 34
+filler line 35
+filler line 36
+filler line 37
+filler line 38
+filler line 39
+filler line 40
+filler line 41
+filler line 42
+filler line 43
+filler line 44
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       1 failed, 8 passed, 9 total
+Snapshots:   0 total
+Time:        2.114 s

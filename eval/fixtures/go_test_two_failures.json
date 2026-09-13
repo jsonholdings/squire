@@ -1,0 +1,7 @@
+{
+  "failures": [
+    {"test": "TestQueueDequeueEmpty", "file": "queue_test.go", "line": 44},
+    {"test": "TestCacheEviction", "file": "cache_test.go", "line": 112}
+  ],
+  "clean": false
+}

@@ -1,0 +1,62 @@
+   Compiling widget-core v0.3.1 (/workspace/widget-core)
+    Finished test [unoptimized + debuginfo] target(s) in 4.55s
+     Running unittests src/lib.rs
+
+running 18 tests
+test parser::tests::test_empty_input ... ok
+test parser::tests::test_nested_braces ... ok
+test math::tests::test_add_overflow ... FAILED
+test math::tests::test_div_by_zero ... ok
+
+failures:
+
+---- math::tests::test_add_overflow stdout ----
+thread 'math::tests::test_add_overflow' panicked at src/math.rs:57:9:
+assertion `left == right` failed
+  left: 4294967295
+ right: 0
+
+filler line 1
+filler line 2
+filler line 3
+filler line 4
+filler line 5
+filler line 6
+filler line 7
+filler line 8
+filler line 9
+filler line 10
+filler line 11
+filler line 12
+filler line 13
+filler line 14
+filler line 15
+filler line 16
+filler line 17
+filler line 18
+filler line 19
+filler line 20
+filler line 21
+filler line 22
+filler line 23
+filler line 24
+filler line 25
+filler line 26
+filler line 27
+filler line 28
+filler line 29
+filler line 30
+filler line 31
+filler line 32
+filler line 33
+filler line 34
+filler line 35
+filler line 36
+filler line 37
+filler line 38
+filler line 39
+filler line 40
+failures:
+    math::tests::test_add_overflow
+
+test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
