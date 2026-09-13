@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
 HOST = os.environ.get("SQUIRE_OLLAMA", "http://127.0.0.1:11434")
@@ -31,6 +32,20 @@ CTX = int(os.environ.get("SQUIRE_CTX", "16384"))    # Ollama defaults to 2048, w
 CHUNK = 24000            # chars per chunk (~6k tokens), leaves room for prompt + answer
 SHORT = 60               # lines at or below this are shown raw, no model call
 TAIL = 25
+LEDGER = os.path.expanduser(os.environ.get("SQUIRE_LEDGER", "~/.squire/ledger.jsonl"))
+CHARS_PER_TOKEN = 4      # rough estimate for English text; stats labels this explicitly as an estimate
+
+
+def log_call(cmd, chars_in, chars_out, backend_ok):
+    # chars_in/out/ts are real, computed facts. The token estimate derived from them in `stats`
+    # is NOT -- CLAUDE.md section 17 requires the two never be presented as the same kind of claim.
+    try:
+        os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
+        with open(LEDGER, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "cmd": cmd, "chars_in": chars_in,
+                                 "chars_out": chars_out, "backend_ok": backend_ok}) + "\n")
+    except OSError:
+        pass  # stats are a bonus; never fail the actual command over a logging error
 
 
 def llm(prompt, max_tokens=300):
@@ -80,10 +95,29 @@ def cmd_run(argv):
         print(f"[squire] --- raw tail ({TAIL} lines) ---")
         print("\n".join(lines[-TAIL:]))
         print("[squire] --- local summary (ASSUMED; the exit code above is authoritative) ---")
-        print(condense(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
+        summary = condense(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
                             "List every failing test/error with file:line and the one-line cause. "
-                            "Say 'no errors seen' only if there are none. Never invent names."))
+                            "Say 'no errors seen' only if there are none. Never invent names.")
+        print(summary)
+        log_call("run", len(out), len(summary), not summary.startswith("UNKNOWN"))
     sys.exit(p.returncode)
+
+
+def cmd_stats(argv):
+    if not os.path.exists(LEDGER):
+        print("[squire] no ledger yet — run some commands first"); return
+    rows = [json.loads(l) for l in open(LEDGER) if l.strip()]
+    if not rows:
+        print("[squire] ledger is empty"); return
+    total_in = sum(r["chars_in"] for r in rows)
+    total_out = sum(r["chars_out"] for r in rows)
+    saved_chars = total_in - total_out
+    ok = sum(1 for r in rows if r["backend_ok"])
+    print(f"[squire] {len(rows)} calls logged ({ok} backend-ok, {len(rows) - ok} UNKNOWN) — REAL, computed from {LEDGER}")
+    print(f"[squire] chars in={total_in} out={total_out} saved={saved_chars} (REAL character counts)")
+    print(f"[squire] ESTIMATED tokens saved: ~{saved_chars // CHARS_PER_TOKEN} "
+          f"(chars/{CHARS_PER_TOKEN} heuristic — NOT a measured token count; cross-check against "
+          "real session usage blocks in ~/.claude/projects/*/*.jsonl before citing this figure)")
 
 
 def main():
@@ -94,18 +128,26 @@ def main():
     if cmd == "run":
         cmd_run(rest)
     elif cmd == "sum":
-        print("[squire] " + condense(read_input(rest[0] if rest else None),
-                                     "Condense to at most 8 factual bullets. Keep numbers, names, paths exact."))
+        text = read_input(rest[0] if rest else None)
+        out = condense(text, "Condense to at most 8 factual bullets. Keep numbers, names, paths exact.")
+        print("[squire] " + out)
+        log_call("sum", len(text), len(out), not out.startswith("UNKNOWN"))
     elif cmd == "ask":
         if not rest:
             sys.exit('usage: squire ask "question" [file|-]')
-        print("[squire] " + condense(read_input(rest[1] if len(rest) > 1 else None),
-                                     f"Answer using ONLY this text; say UNKNOWN if it is not there. Question: {rest[0]}"))
+        text = read_input(rest[1] if len(rest) > 1 else None)
+        out = condense(text, f"Answer using ONLY this text; say UNKNOWN if it is not there. Question: {rest[0]}")
+        print("[squire] " + out)
+        log_call("ask", len(text), len(out), not out.startswith("UNKNOWN"))
     elif cmd == "draft":
         if not rest:
             sys.exit('usage: squire draft "instructions" [file|-]')
         src = read_input(rest[1]) if len(rest) > 1 else ""
-        print(llm(f"{rest[0]}\n\nSource material (may be empty):\n{src[:CHUNK]}", 1200))
+        out = llm(f"{rest[0]}\n\nSource material (may be empty):\n{src[:CHUNK]}", 1200)
+        print(out)
+        log_call("draft", len(src), len(out), not out.startswith("UNKNOWN"))
+    elif cmd == "stats":
+        cmd_stats(rest)
     else:
         sys.exit(f"unknown command {cmd!r}; see squire --help")
 
