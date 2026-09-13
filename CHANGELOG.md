@@ -3,6 +3,19 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- **Corrected headline: benchmark tokens-saved figure overclaimed (S8c).** The published
+  headline (92.9%, n=118) pooled two workload types with near-equal sample sizes but very
+  different savings profiles (whole-file summarization ~96%, live noisy-command wrapping
+  ~69%), so the blended median sat at the boundary between them rather than representing
+  either. Split into two separately-reported, separately-CI'd numbers: live noisy commands
+  (headline) **68.8%, n=58, 95% CI [63.0%, 69.2%]**, and whole-file summarization (reported
+  separately, not blended) **96.0%, n=60, 95% CI [95.8%, 96.2%]**. Also added a Wilson-score
+  95% CI to every pass/fail proportion that previously had none (deterministic exit-code
+  100.0%/n=43 → CI [91.8%, 100.0%]; live exit-code 96.6%/n=58 → CI [88.3%, 99.0%]). See
+  `docs/BENCHMARK.md` "S8c correction". No new model runs — recomputed from the existing
+  `data/benchmark-checkpoint.jsonl`.
+
 ### Added
 - **Deterministic exit-code benchmark corpus (S8b), gate for public publish.** S8 found the
   benchmark's exit-code cell flipped because its cmd-workload corpus ran two separate live

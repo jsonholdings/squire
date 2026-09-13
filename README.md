@@ -230,14 +230,26 @@ see SAVINGS.md's Limits section.
 bootstrap 95% CI, resumable) covering token savings, exit-code fidelity, and failing-test-name
 recall. Full method, corpus and limitations: [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
 
-**Headline (2026-09-13, RTX 3090 + qwen2.5:14b, real concurrent load present on the host):**
+**Headline (2026-09-13, RTX 3090 + qwen2.5:14b, real concurrent load present on the host).**
+**Corrected 2026-09-13 (S8c):** the previous headline pooled two very different workload types
+(whole-file summarization, which compresses to near-100% by construction, and live noisy-command
+wrapping) into one median. Because the two groups have nearly equal sample sizes but very
+different savings, the pooled median sat at the boundary between them and read as ~93% —
+overstating what a typical noisy command sees. The two are now reported separately, and every
+number carries n and a named 95% CI (bootstrap for medians/means, Wilson score interval for
+pass/fail proportions):
 
-| Metric | Value | n | Note |
-|---|---|---|---|
-| Exit code preserved (deterministic gate corpus) | **100.0%** | 43 | Frozen fixtures with a known-in-advance exit code; see "Method" below |
-| Failing-test-name recall (mean) | 1.00 | 50 | Hand-written answer key, no model-derived ground truth |
-| Tokens saved (median, chars/4 approximation) | 92.9% | 118 | Approximation, not an exact tokenizer count — no tokenizer library installed on the benchmark host |
-| Exit code preserved (live pytest-suite corpus, reported separately) | 96.6% | 58 | Load-sensitive: two live invocations of a real pytest suite can genuinely disagree under contention; kept for the historical record, never gate-relevant |
+| Metric | Value | n | 95% CI | Note |
+|---|---|---|---|---|
+| Tokens saved, live noisy commands (median, chars/4 approx) | **68.8%** | 58 | [63.0%, 69.2%] (bootstrap) | Headline real-workload figure — `pytest -v`/`pytest -q`/`find` against this repo |
+| Tokens saved, whole-file summarization (median, chars/4 approx) | 96.0% | 60 | [95.8%, 96.2%] (bootstrap) | Reported separately, not blended into the headline — `squire.py`/`README.md`/a test file condensed to ≤8 bullets is a favorable, less representative case |
+| Exit code preserved (deterministic gate corpus) | **100.0%** | 43 | [91.8%, 100.0%] (Wilson) | Frozen fixtures with a known-in-advance exit code; see "Method" below |
+| Exit code preserved (live pytest-suite corpus, reported separately) | 96.6% | 58 | [88.3%, 99.0%] (Wilson) | Load-sensitive: two live invocations of a real pytest suite can genuinely disagree under contention; kept for the historical record, never gate-relevant |
+| Failing-test-name recall (mean) | 1.00 | 50 | [1.0, 1.0] (bootstrap; collapses — every rep recalled exactly 1.0) | Hand-written answer key, no model-derived ground truth |
+
+No number above includes the deterministic exit-code fixtures or the synthetic pytest-shaped
+fidelity cases in a token-savings figure — those corpora exist to test exit-code passthrough and
+summary recall, not compression ratio, and contribute no `pct_saved` values at all.
 
 **Method, in one paragraph:** the exit-code number that gates a publish is computed ONLY from
 a frozen, secret-free, no-network fixture corpus (a script that exits with a fixed code baked

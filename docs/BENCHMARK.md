@@ -286,6 +286,54 @@ recompute a specific subset.
 `python3.13 scripts/benchmark.py --report --json` (stats from the existing checkpoint, no new
 model calls). Both read/append `data/benchmark-checkpoint.jsonl`.
 
+## S8c correction (2026-09-13) — headline overclaimed, no CIs on proportions, fixed
+
+**The problem, found on re-review of the published 9ac33c1:** `aggregate()` in
+`scripts/benchmark.py` computes `tokens_pct_saved` as `summarize_reps(file_trials + cmd_trials,
+"pct_saved")` — a single median over BOTH groups pooled together. Verified live
+(`python3.13 scripts/benchmark.py --report --json` against the current checkpoint, n grown to
+118 as more full-run reps completed): file-workload savings are consistently 92.9–99.0%
+(median 96.0%, n=60, whole files compressed to ≤8 bullets), while live cmd-workload savings
+range from -1328% (one lock-contention outlier on the short-output control, which should save
+~0%) to 90% (median 68.8%, n=58). With near-equal group sizes and very different distributions,
+the pooled median lands right at the boundary between the two groups (~93%) — a number driven
+by which group happens to have one more or fewer completed rep, not by anything squire's
+behavior changed. This is NOT the deterministic/synthetic exit-code corpus leaking into the
+metric — `trial_deterministic_cmd_workload` reps carry no `pct_saved` field at all, confirmed
+by reading the code and the checkpoint. It is two legitimately-real workload types (whole-file
+summarization vs. live noisy-command wrapping) being blended into one number that reads as a
+single "real-world savings" figure when it isn't representative of either group alone.
+
+**Fix:** report the two groups separately, each with its own n and a named 95% CI, and never
+publish a blended median across them again:
+- **Tokens saved, live noisy commands (headline): 68.8%, n=58, 95% CI [63.0%, 69.2%]** (bootstrap,
+  same 2000-resample method as before) — this is the number that represents typical `squire run`
+  usage (wrapping `pytest -v`/`pytest -q`/`find` against this repo).
+- **Tokens saved, whole-file summarization: 96.0%, n=60, 95% CI [95.8%, 96.2%]** (bootstrap) —
+  reported separately, explicitly labelled as a more favorable, less representative case
+  (`squire sum` on a whole source file), never folded into the headline.
+
+**CIs added to every proportion that lacked one** (publish rule: n + 95% CI on every number).
+Bootstrap is inappropriate for a simple pass/fail proportion at the edge of its range (e.g.
+100%/n=43 collapses to a zero-width interval that overstates certainty); used the Wilson score
+interval instead, named as such:
+- Exit code preserved (deterministic gate corpus): 100.0%, n=43, 95% CI [91.8%, 100.0%] (Wilson).
+- Exit code preserved (live corpus, reported separately): 96.6%, n=58, 95% CI [88.3%, 99.0%]
+  (Wilson).
+- Failing-test-name recall (mean): 1.00, n=50 — bootstrap CI already correctly reported as
+  [1.0, 1.0] (collapses because every rep's recall was exactly 1.0); kept as-is.
+
+**Latency:** the existing p50/p95-by-concurrency table already carries n per level and is kept
+as-is; no CI is added because a bootstrap CI on a small-n (6–10) wall-clock sample under a
+stated, uncontrolled GPU-contention confound would imply more precision than the measurement
+supports — the existing "Limitations" language (contention, not isolated-hardware numbers)
+stays the honest caveat instead of a false-precision interval.
+
+**Reproduce this correction:** `python3.13 scripts/benchmark.py --report --json` against the
+existing `data/benchmark-checkpoint.jsonl` (no new model calls); the file/cmd split and Wilson
+CIs above were computed directly from that JSON's `file_trials`/`cmd_trials`/
+`deterministic_cmd_trials` reps.
+
 **Limitations, stated plainly:**
 - The deterministic corpus proves exit-code *passthrough* is reliable; it does not by itself
   prove summary *quality* under load — that is `failing_name_recall` (fidelity cases, still
