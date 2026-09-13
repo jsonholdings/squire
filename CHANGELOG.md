@@ -3,6 +3,12 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- `scripts/sync_to_mirror.py` (source-repo tooling, not shipped in this mirror): an explicit
+  ALLOW-list sync from the private source repo to this public mirror, with a `--check` parity
+  report and an `--apply` that stages changes and only publishes them after this repo's own
+  `scrub_check.py` and pytest suite both pass in a CI-like environment. Closes the "no
+  source->mirror sync script exists" gap flagged at the 0.2.5 release.
 
 ## [0.2.5] - 2026-09-12
 ### Fixed
