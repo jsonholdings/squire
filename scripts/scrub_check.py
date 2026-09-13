@@ -32,7 +32,11 @@ SKIP_DIRS = {"eval/fixtures"}
 
 GENERIC_PATTERNS = {
     "home path": r"/home/[a-z][a-z0-9_-]*",
-    "email address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?!:)",  # \b(?!:) excludes git@host:path SSH URLs
+    # \b(?!:) excludes a git@host:path SSH URL; the domain lookahead excludes RFC
+    # 2606 reserved test domains (example.com/.org/.net, .test, .invalid, .localhost)
+    # -- synthetic addresses used deliberately in tests and docs, never real leaks.
+    "email address": r"[A-Za-z0-9._%+-]+@(?!(?:[A-Za-z0-9.-]+\.)?(?:example\.(?:com|org|net)"
+                      r"|test|invalid|localhost)\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?!:)",
     "private IPv4": r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
                      r"|192\.168\.\d{1,3}\.\d{1,3}"
                      r"|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",

@@ -3,6 +3,21 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Single-source logo build: `docs/assets/logo-source.svg` is now the only hand-maintained
+  logo file. `scripts/build_logo_assets.py` regenerates `icon.svg`, `logo-light.svg`,
+  `logo-dark.svg`, `social-preview.svg`/`.png` (1280x640) and prints the inline `<svg>`
+  snippet jsonholdings.com's card embeds. `--check` (a sha256 manifest, never a byte
+  comparison of rendered output) is wired into `pytest`
+  (`tests/test_logo_assets.py`) so CI fails on a stale asset. Documented in
+  `docs/assets/logo.md`. Mirrored into the private source repo (path-only commit).
+
+### Security
+- `scrub_check.py`'s email-address pattern no longer flags RFC 2606 reserved test
+  domains (`example.com`/`.org`/`.net`, `.test`, `.invalid`, `.localhost`) -- synthetic
+  addresses used deliberately in tests (`tests/test_squire.py`'s `GIT_ENV`) and docs,
+  never a real leak. Control-proofed: a non-reserved domain still fires.
+
 ### Fixed
 - Tests: the `squire diff` tests' temporary git repos now carry their own identity and ignore
   the machine's git config (`GIT_CONFIG_GLOBAL=/dev/null`, no signing). CI runners have no

@@ -1,0 +1,10 @@
+{
+  "source_sha256": "bf8df7353c8fdd388ff07ce2e4f413ae07314181b687bf2a439fe6a3538d1abd",
+  "outputs": [
+    "icon.svg",
+    "logo-light.svg",
+    "logo-dark.svg",
+    "social-preview.svg",
+    "social-preview.png"
+  ]
+}

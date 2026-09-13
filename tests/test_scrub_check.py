@@ -170,13 +170,25 @@ def test_git_ssh_clone_url_is_not_an_email_finding():
 def test_a_real_email_address_is_still_caught_control():
     target = os.path.join(ROOT, "CTRL_EMAIL.md")
     with open(target, "w") as fh:
-        fh.write("Contact us at " + "hello" + "@" + "example.com" + ", any time.\n")
+        # A non-reserved domain -- example.com/.org/.net/.test/.invalid/.localhost are
+        # deliberately excluded as synthetic (see test below), so the control must use
+        # a domain shape that is NOT on that allow-list to prove real ones still fire.
+        fh.write("Contact us at " + "hello" + "@" + "not-a-reserved-domain.co" + ", any time.\n")
     try:
         code, out = _run(env={"SQUIRE_SCRUB_DENYLIST": "/nonexistent/does-not-exist.txt"})
         assert code == 1, out
         assert "email address" in out
     finally:
         os.remove(target)
+
+
+def test_reserved_test_domains_are_not_findings():
+    """RFC 2606 reserved domains (example.com/.org/.net, .test, .invalid, .localhost)
+    are synthetic by definition -- used deliberately in tests (see
+    tests/test_squire.py's GIT_ENV) and docs, never a real leak."""
+    for addr in ("tests@example.invalid", "a@example.com", "user@my.example.org",
+                 "x@thing.test", "y@thing.localhost"):
+        _plant_and_check("contact: " + addr, expect_caught=False, filename="CTRL_RESERVED.md")
 
 
 def test_a_denylist_file_copied_into_the_repo_is_itself_a_finding():
