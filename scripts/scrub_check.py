@@ -22,6 +22,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SKIP = {"SESSION-CLAIM.md"}  # session-claim's own generated, gitignored marker file only
+# Synthetic captured test-runner output used by eval/run_eval.py's fixtures -- built by
+# hand to look like real pytest/go test logs (test names like "TestQueueEnqueue",
+# "test_token_expiry"), never real credentials. The secret-shaped pattern's "pass"/
+# "token" keys legitimately fire on this kind of fixture text ("PASS:", "token = ...()")
+# with no way to generalise the regex around it without also hiding real leaks in
+# ordinary code -- explicitly allow-listed by directory rather than weakened globally.
+SKIP_DIRS = {"eval/fixtures"}
 
 GENERIC_PATTERNS = {
     "home path": r"/home/[a-z][a-z0-9_-]*",
@@ -29,7 +36,16 @@ GENERIC_PATTERNS = {
     "private IPv4": r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
                      r"|192\.168\.\d{1,3}\.\d{1,3}"
                      r"|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",
-    "secret-shaped": r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}",
+    # Unquoted on purpose (feedback_secret_scan_needs_unquoted_pattern.md): a
+    # quote-requiring pattern misses the shape a person actually writes a credential
+    # down in -- a bare key-colon-value line, not only a quoted literal. Colon or
+    # equals, quoted or not, either side of whitespace. A placeholder right after the
+    # separator (angle brackets, a shell/template variable, a REDACTED marker, a
+    # run of asterisks, or an ellipsis) is deliberately excluded, and a value cannot
+    # start with a markdown code-span backtick, so this comment and the redaction
+    # docs describing the very shape below do not trip themselves.
+    "secret-shaped": r"(?i)\b(pass(?:word|wd)?|secret|api[_-]?key|access[_-]?token|token)\b"
+                      r"\s*[:=]\s*['\"]?(?!<|\$\{|\[REDACTED\]|\*{2,}|\.\.\.|`)[^\s'\"`]{8,}",
 }
 
 
@@ -64,6 +80,9 @@ def main():
     findings = []
     for f in ROOT.rglob("*"):
         if not f.is_file() or f.name in SKIP or ".git" in f.parts or "__pycache__" in f.parts:
+            continue
+        rel_posix = f.relative_to(ROOT).as_posix()
+        if any(rel_posix == d or rel_posix.startswith(d + "/") for d in SKIP_DIRS):
             continue
         text = f.read_text(errors="ignore")
         for label, pat in patterns.items():

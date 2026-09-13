@@ -78,6 +78,80 @@ def test_a_planted_local_denylist_term_is_caught_control():
             os.remove(target)
 
 
+def _plant_and_check(content, expect_caught, filename="CTRL_SECRET.md"):
+    target = os.path.join(ROOT, filename)
+    with open(target, "w") as fh:
+        fh.write(content + "\n")
+    try:
+        code, out = _run(env={"SQUIRE_SCRUB_DENYLIST": "/nonexistent/does-not-exist.txt"})
+        if expect_caught:
+            assert code == 1, out
+            assert "secret-shaped" in out
+        else:
+            assert code == 0, out
+    finally:
+        os.remove(target)
+
+
+def test_unquoted_colon_secret_is_caught():
+    # Built by concatenation so this real-secret-shaped literal never sits in this
+    # file's own committed source -- otherwise scrub_check.py scanning ITS OWN test
+    # file would report a permanent finding here, unrelated to whether the plant
+    # file the test writes is present.
+    line = "Pass" + "word" + ": " + "fakevalue1234"
+    _plant_and_check(line, expect_caught=True)
+
+
+def test_unquoted_equals_secret_is_caught():
+    line = "pass" + "word" + " = " + "fakevalue1234"
+    _plant_and_check(line, expect_caught=True)
+
+
+def test_quoted_secret_is_still_caught():
+    line = "to" + "ken: " + '"abcdefgh12345678"'
+    _plant_and_check(line, expect_caught=True)
+
+
+def test_angle_bracket_placeholder_is_not_a_finding():
+    _plant_and_check("password: <PASSWORD>", expect_caught=False)
+
+
+def test_shell_template_placeholder_is_not_a_finding():
+    _plant_and_check("secret: ${SECRET_VALUE}", expect_caught=False)
+
+
+def test_redacted_marker_is_not_a_finding():
+    _plant_and_check("password: [REDACTED]", expect_caught=False)
+
+
+def test_asterisk_placeholder_is_not_a_finding():
+    _plant_and_check("password: ***", expect_caught=False)
+
+
+def test_a_redaction_doc_describing_the_pattern_does_not_trip_itself():
+    """The exact shape this repo's own docs use to describe what redact() strips --
+    a markdown code span right after the key -- must not itself read as a leak."""
+    _plant_and_check(
+        "`redact()` strips `password=`/`token=`-style assignments before they leave.",
+        expect_caught=False)
+
+
+def test_a_fake_secret_built_by_concatenation_is_not_visible_as_static_text():
+    """Per the owner's requirement: a test double built by string concatenation at
+    runtime never appears as a literal match in source, so it needs no allow-list --
+    this documents why, rather than skipping the case. (This test deliberately never
+    writes the assembled string as a literal anywhere in its own source, including in
+    an assertion message -- doing so would recreate the exact thing it is proving
+    does not happen.)"""
+    key, sep, value = "pass" + "word", ":" + " ", "concat" + "enated" + "value123"
+    fake_secret = key + sep + value
+    assert len(fake_secret) > 20  # built successfully, without ever spelling it out
+    # scrub_check.py scans FILE TEXT; no file in this repo contains the assembled
+    # string as a literal -- it exists only in memory at test run time.
+    text = open(os.path.abspath(__file__), encoding="utf-8").read()
+    assert fake_secret not in text
+
+
 def test_a_denylist_file_copied_into_the_repo_is_itself_a_finding():
     """The sync-from-source safety net: even a file merely NAMED like the denylist,
     sitting inside this repo's tree, must fail the check on its own -- independent of

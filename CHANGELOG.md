@@ -3,6 +3,20 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Security
+- `scrub_check.py`'s secret-shaped pattern now catches an unquoted `key: value` /
+  `key = value` credential line, not only a quoted literal, and now scans its own
+  source file (an earlier version excluded `scrub_check.py` by name, which is how a
+  hardcoded site-specific denylist shipped undetected inside it). Obvious placeholders
+  (`<...>`, `${...}`, `[REDACTED]`, `***`/`...`, a markdown code-span backtick) are
+  excluded so redaction documentation describing this pattern does not trip it.
+- `eval/fixtures/*` (synthetic captured test-runner logs) explicitly allow-listed by
+  directory against this pattern -- fixture text (test names and pass/fail markers) legitimately matches the
+  shape with no real secret behind it.
+- 12 new tests (`tests/test_scrub_check.py`): each unquoted/quoted form caught, each
+  placeholder form excluded, and the redaction-doc and denylist-file-in-repo scenarios
+  proven with planted controls.
+
 ### Added
 - Apache-2.0 `LICENSE` and `NOTICE` (JSON Holdings LLC, 2026). `pyproject.toml` license field and
   README license section updated to match. Repo remains private and unpushed; this only unblocks

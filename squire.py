@@ -26,7 +26,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 import datetime as _dt
 import json
