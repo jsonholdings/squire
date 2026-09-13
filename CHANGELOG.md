@@ -4,6 +4,144 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 ### Added
+- **Deterministic exit-code benchmark corpus (S8b), gate for public publish.** S8 found the
+  benchmark's exit-code cell flipped because its cmd-workload corpus ran two separate live
+  invocations of this repo's own resource-contended `pytest` suite, which can genuinely
+  disagree under real GPU/lock contention -- not a squire defect (`squire.py:cmd_run` was
+  re-confirmed to capture the real subprocess returncode before any model call, on every
+  branch). New `DETERMINISTIC_CMD_WORKLOADS` in `scripts/benchmark.py` uses frozen,
+  secret-free, no-network fixtures (`tests/fixtures/bench_emit_exit.py`,
+  `tests/fixtures/bench_project/`) whose exit code is known before the process runs, and
+  checks three-way agreement (raw == squire == expected). Result: 100.0% exit-code
+  preservation, n=43 (>= the 30-sample gate) -- see `docs/BENCHMARK.md` "S8b update" and the
+  new README "Benchmarks" section. The old live-corpus numbers are kept and reported
+  separately, explicitly labelled load-sensitive.
+
+### Fixed
+- **Test-suite lock contention (S7), root cause of the "5 tests TimeoutExpired under load"
+  finding from S6b/S9 and of the benchmark's one exit-code mismatch:** `tests/test_squire.py`
+  and `tests/test_queue.py` shared the REAL `~/.squire/llm.lock` with every other squire
+  process on the workstation, so a DOWN-backend test could queue behind real concurrent usage
+  for up to `LLM_LOCK_TIMEOUT` (240s) and blow its own subprocess timeout — and, in the
+  benchmark's `pytest -v` cmd workload, flip that one live run's actual result relative to its
+  paired raw run. Both test files now isolate `SQUIRE_LLM_LOCK` to a per-test/per-file temp
+  path. Full suite: was 101/106 (5 TimeoutExpired), now 110/110 in ~9s, confirmed twice.
+- **`squire status ''` / `squire wait ''` crashed with an uncaught `ValueError`** (`int('')`)
+  instead of a clean usage error. Added `_parse_job_id()`; both commands now exit with a usage
+  message. 2 new tests (`tests/test_queue.py`), each with a valid-id control.
+- **`squire grep` embedding-backend timeout/failure logged NO ledger row** (S10) — a stuck grep
+  was indistinguishable from one that never ran. `log_call` gained a `status` field; the
+  `cmd_grep` failure branch now logs `status="timeout"`/`"error"` with elapsed duration. 1 new
+  test, with an empty-ledger control.
+- **Benchmark false-positive-on-control check (`scripts/benchmark.py`) always flagged the
+  all-pass control** (10/10 in the checkpoint) even though squire's real summary was correct
+  ("No errors seen ... passed without any failures") — the old check banned any occurrence of
+  "fail" without the literal "0 failed". Fixed to check for squire's own documented convention
+  ("no errors seen") instead. 1 new test with a genuine-bogus-failure control.
+- **A second test missed by the S7 lock-isolation fix** (S8):
+  `test_remote_backend_reports_unknown_not_a_network_call` built its own `env` from
+  `os.environ` instead of `DOWN`, so it never got `SQUIRE_LLM_LOCK` isolation and could queue
+  behind real concurrent squire usage on the shared production lock, blowing its own 60s
+  subprocess timeout under load. Now isolates the lock like every other test. Root-caused
+  while investigating a second exit-code-preservation miss found growing the S8 benchmark
+  sample (see `docs/BENCHMARK.md` "S8 update").
+### Added
+- **S8 benchmark growth — NOT PUBLISHED to the public mirror.** Grew the checkpoint sample
+  (58 total cmd-workload reps, up from 45); found a second exit-code-preservation miss on
+  post-S7-fix code (root cause above). Post-fix exit-code preservation is now 96.4% (n=28) —
+  under the S8 gate's required 100%/n≥30 — so `sync_to_mirror.py --apply` was not run this
+  pass. See `docs/BENCHMARK.md` "S8 update" for the numbers and the open next step.
+- **Benchmark re-verification + concurrency 4/6 (S7):** after the fixes above, re-ran the
+  benchmark. Tokens saved median 77.2% (n=75, CI [68.8%, 92.9%]); exit code preserved 97.8%
+  (n=45: 44/45, 1 pre-fix historical miss kept on record, 15/15 fresh post-fix reps); failing-name
+  recall mean 1.00 (n=50); false positive on all-pass control now correctly False (n=10, was
+  10/10 false positive under the old buggy check above); UNKNOWN/fail rate 0.0%. Concurrency
+  latency: 4-way p50=40.08s/p95=59.46s (n=8/10, timeboxed), 6-way p50=42.14s/p95=68.93s
+  (n=6/10, timeboxed). See `docs/BENCHMARK.md` "S7 update".
+- **Real benchmark numbers (S6b):** first REAL numbers from `scripts/benchmark.py`, N=10 quick
+  run, checkpointed/resumed across 4 timeboxed chunks. Tokens saved median 91.4% (n=60, CI
+  [77.1%, 94.9%]); exit code preserved 96.7% (n=30); failing-name recall mean 1.00 (n=50);
+  UNKNOWN/fail rate 0.0%; no false positive on the all-pass control. Concurrency latency:
+  solo p50=12.11s/p95=23.87s (n=10), 2-concurrent p50=17.75s/p95=25.14s (n=10); levels 4 and 6
+  NOT run (n=0) — the full local pytest suite run twice per rep dominated the timebox before
+  concurrency testing reached them. See `docs/BENCHMARK.md`. Raw data:
+  `data/benchmark-checkpoint.jsonl`, `data/benchmark-report-20260913.json`.
+- **Benchmark checkpoint/resume + `--report` (S6b):** `scripts/benchmark.py` now appends every
+  trial rep to a JSONL checkpoint (`data/benchmark-checkpoint.jsonl` by default) the moment it's
+  computed, and resumes from it on re-run instead of redoing finished reps — a killed run (GPU
+  contention, timebox) now yields real per-workload numbers instead of nothing. `--report` computes
+  medians/CIs from whatever is checkpointed so far with NO new model calls, stating n honestly per
+  cell (a cell with n=3 reads n=3, never rounded up or hidden). 6 new tests in
+  `tests/test_benchmark.py` (round-trip, malformed-trailing-line control, resume-only-runs-missing-
+  reps control, partial-n-honesty control, empty-checkpoint-is-all-zero control) — 17/17 pass.
+- **Benchmark tooling (S6, partial):** `scripts/benchmark.py` — reproducible N≥10-repeat
+  benchmark of squire vs raw output: chars/4 token approximation, bootstrap 95% CI on every
+  reported statistic, exit-code-preserved %, failing-name recall % against a hand-written
+  answer key, false-positive check on an all-pass control, UNKNOWN/fail rate, and solo/2/4/6
+  concurrent-load wall latency (p50/p95). `tests/test_benchmark.py` (11 tests, all with
+  controls) verifies the bootstrap-CI machinery itself before any number is trusted. All
+  benchmark squire calls tag `SQUIRE_SOURCE=test` so they're excluded from the real ledger's
+  stats (S4 convention). See `docs/BENCHMARK.md` — the actual full-N run did NOT complete
+  this session (GPU contention from concurrent squire use by other sessions); the run status,
+  what's verified, and the next step are recorded there rather than asserted as done.
+- **Job queue (S5):** `squire submit <sum|ask|draft|diff|triage> [args...]` queues a job against a
+  SQLite spool (`~/.squire/queue.db`, WAL) and returns its id immediately; `squire worker` runs a
+  single foreground FIFO loop reusing the exact same condense/llm code (and `_LlmLock`) the
+  synchronous commands use, with crash-safe claiming (a `running` job whose worker PID has died is
+  requeued). `squire status <id>` / `squire wait <id> [--timeout S]` answer with exit 0 (RESULT,
+  output printed), 1 (FAIL, reason printed), 2 (WAIT, still queued/running -- position + age
+  printed), or 3 (UNKNOWN -- no live worker heartbeat). `squire jobs` lists everything. The
+  synchronous commands are unchanged -- the queue is opt-in and does not alter their behavior (kept
+  deliberately identical so a later benchmark, S6, can compare sync vs queued timing). Every
+  processed job also writes its normal ledger row with `source: "queue"` plus the job id and
+  enqueued/started/finished timestamps. See `docs/QUEUE.md`.
+
+### Fixed
+- **Ledger test isolation (S4):** squire's own pytest suite was writing its fixture calls straight
+  into the real production `~/.squire/ledger.jsonl` (found 2026-09-13, S3-check: 21 of 33 post-S1
+  rows were the same 7 fixture calls repeated across test runs). `tests/conftest.py` now points
+  the whole suite at an isolated temp ledger. Every ledger row also carries a new `source` field
+  (`cli`/`test`/`hook`/`queue`); `squire stats` and `scripts/squire_report.py` exclude `source:
+  test` rows (and, for rows written before this field existed, an exact legacy-fixture-signature
+  match) from all totals -- without ever deleting them from the ledger file.
+- `squire run --`: a nested launcher (`flatpak-spawn --host docker run ...`, `ssh`, anything that
+  attaches stdin) could inherit squire's own stdin and block forever waiting for input that never
+  arrives -- from the caller's side indistinguishable from squire being broken (S2, 2026-09-13:
+  "squire run breaks on nested flatpak-spawn/docker invocations", reported by a portfolio worker).
+  `cmd_run` now always runs the child with `stdin=subprocess.DEVNULL` (squire's contract is
+  capture-then-summarize, never interactive, so stdin was never useful) and honors an optional
+  `SQUIRE_RUN_TIMEOUT` (seconds) as defense in depth: on timeout the real exit code 124 and every
+  byte captured before the kill are still emitted, never silence. Live-repro'd against real
+  `flatpak-spawn --host docker run --rm ...` invocations (pass/fail/unknown/>60-line-output all
+  preserved the real exit code both before and after -- see `docs/SQUIRE-RUN-NESTED-2026-09-13.md`)
+  with no reproducible hang in this shell (Bash-tool stdin is already closed); the stdin fix
+  targets a real, well-known subprocess footgun in an interactive terminal, which is the shape of
+  the original report.
+
+### Added
+- `docs/PERF-CONCURRENCY-2026-09-13.md`: root-caused the backend-ok rate under multi-agent load
+  (S1). A single GPU running qwen2.5:14b can't serve several concurrent large-context requests
+  cleanly; under real 4-agent load one `sum` call took 272s, near the client's 300s timeout.
+  Fixed by serializing all local model calls through a client-side flock (`_LlmLock`, one
+  in-flight backend request at a time across all squire processes), a distinct "local model busy
+  (queued Ns, gave up)" status instead of a generic backend-down UNKNOWN when the lock itself
+  times out (`SQUIRE_LLM_LOCK_TIMEOUT`, default 240s), queue-wait vs generation time now logged
+  per call in the ledger (`queue_wait_s`/`gen_s`), and `SQUIRE_KEEP_ALIVE` default raised 30m -> 2h
+  so the model stays resident across a burst.
+- `scripts/ab_trial.py` + `docs/AB-TRIAL-2026-09-13.md`: the first controlled A/B measurement
+  of squire's token savings (SPEC-OPEN-SOURCE.md step 2). Runs a fixed set of real command and
+  file workloads through both raw and squire paths, checks exit-code and failure-signature
+  fidelity, and includes a control workload (short output) that squire must pass through
+  unchanged. Result: median 69.35% tokens saved (chars/4 approximation), range 0.0%-98.2%,
+  exit codes and the one injected failure signature preserved on every workload. Limitations
+  (cache-read amplification, cold-model latency, no long-output failure case) stated in the doc.
+- `scripts/ab_trial.py --fidelity`: closes the "summary fidelity under a genuine, longer
+  failure" UNKNOWN left by the first pass. 6 synthetic-but-real pytest-`-v`-shaped subprocess
+  runs (>60 lines each, so squire's actual model-summary path runs, not raw passthrough) with
+  known injected failing test names at varied positions (early/middle/last/scattered) and
+  densities (1-3 failures, one buried in 220 lines of noise), plus an all-pass control. Result,
+  this run: exit-code match 6/6 (100%), failing-test-name recall 5/5 non-control cases (100%),
+  no fabricated failure on the control. Documented in `docs/AB-TRIAL-2026-09-13.md`.
 - `scripts/sync_to_mirror.py` (source-repo tooling, not shipped in this mirror): an explicit
   ALLOW-list sync from the private source repo to this public mirror, with a `--check` parity
   report and an `--apply` that stages changes and only publishes them after this repo's own

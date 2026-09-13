@@ -17,9 +17,11 @@ Offload the bulk, keep the context.
 - [Install](#install)
 - [Quickstart](#quickstart)
 - [Commands](#commands)
+- [Job queue](#job-queue)
 - [Backends](#backends)
 - [Claude Code integration](#claude-code-integration)
 - [Measuring savings](#measuring-savings)
+- [Benchmarks](#benchmarks)
 - [Accuracy eval](#accuracy-eval)
 - [License](#license)
 - [Contributing / Security](#contributing--security)
@@ -170,6 +172,18 @@ All commands below are implemented in `squire.py` (verified via `squire --help`,
 | `--json` | Every command above accepts it; emits `{cmd, exit_code, raw_tail, summary, assumed, backend_ok, verify_flag}`. |
 | `--version` | Prints `squire.py`'s version. |
 
+## Job queue
+
+**Implemented (S5, 2026-09-13).** A SQLite spool at `~/.squire/queue.db` (WAL mode) lets
+multiple Claude sessions submit `sum`/`ask`/`draft`/`diff`/`triage` jobs without blocking on each
+other or on the local GPU: `squire submit <cmd> [args...]` captures the input and returns a job id
+immediately; a foreground `squire worker` claims and runs jobs FIFO, one at a time, reusing the
+existing model-call code and lock; `squire status`/`squire wait`/`squire jobs` check on a job.
+Exit codes: `0` result, `1` fail, `2` still waiting, `3` no worker running. Every queued job also
+lands in the normal `~/.squire/ledger.jsonl` (`source: "queue"`) so sync vs. queued timing can be
+compared later (S6). The synchronous commands above are unaffected — the queue is opt-in. Full
+spec: [`docs/QUEUE.md`](docs/QUEUE.md).
+
 ## Backends
 
 `SQUIRE_BACKEND=ollama` (default) or `openai` (any OpenAI-compatible localhost server — llama.cpp,
@@ -209,6 +223,33 @@ shows 96% of the characters sent to it were kept out of context entirely (MEASUR
 with an ESTIMATED 18.7M cache-read tokens avoided across the 38% of calls correlated to a session
 so far — an upper bound for that minority of usage, not a total. No dollar figure or controlled A/B yet;
 see SAVINGS.md's Limits section.
+
+## Benchmarks
+
+`scripts/benchmark.py` is a reproducible, checkpointed benchmark (n>=10 repeats per workload,
+bootstrap 95% CI, resumable) covering token savings, exit-code fidelity, and failing-test-name
+recall. Full method, corpus and limitations: [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
+**Headline (2026-09-13, RTX 3090 + qwen2.5:14b, real concurrent load present on the host):**
+
+| Metric | Value | n | Note |
+|---|---|---|---|
+| Exit code preserved (deterministic gate corpus) | **100.0%** | 43 | Frozen fixtures with a known-in-advance exit code; see "Method" below |
+| Failing-test-name recall (mean) | 1.00 | 50 | Hand-written answer key, no model-derived ground truth |
+| Tokens saved (median, chars/4 approximation) | 92.9% | 118 | Approximation, not an exact tokenizer count — no tokenizer library installed on the benchmark host |
+| Exit code preserved (live pytest-suite corpus, reported separately) | 96.6% | 58 | Load-sensitive: two live invocations of a real pytest suite can genuinely disagree under contention; kept for the historical record, never gate-relevant |
+
+**Method, in one paragraph:** the exit-code number that gates a publish is computed ONLY from
+a frozen, secret-free, no-network fixture corpus (a script that exits with a fixed code baked
+into its own argv, plus a small pytest fixture project with a known pass/fail split) — each
+repeat checks three-way agreement (raw process == squire-wrapped process == the fixture's
+known-correct answer), which a flaky live corpus cannot guarantee even when its own two runs
+happen to agree with each other. Tokens are approximated as chars/4, matching squire's own
+runtime heuristic. Every number above has a reproduce command in `docs/BENCHMARK.md`.
+
+**Limitations:** the model runs on a single shared GPU also used by other concurrent sessions
+on the host that produced these numbers — latency figures reflect that contention and are not
+isolated-hardware numbers; token savings depend on workload verbosity and will vary by corpus.
 
 ## Accuracy eval
 

@@ -29,6 +29,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from squire import is_test_row  # noqa: E402 -- same test-row exclusion squire stats uses (S4)
+
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 DEFAULT_LEDGER = os.path.expanduser(os.environ.get("SQUIRE_LEDGER", "~/.squire/ledger.jsonl"))
 CHARS_PER_TOKEN = 4  # same heuristic as squire.py's `stats` command; ESTIMATE only, never VERIFIED
@@ -47,7 +50,7 @@ def load_ledger(path):
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return rows
+    return [r for r in rows if not is_test_row(r)]
 
 
 def iter_session_files(project_filter=None):

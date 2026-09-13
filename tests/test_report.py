@@ -21,6 +21,10 @@ def make_session(path, usages):
 def run_report(env_home, extra_args=None):
     env = dict(os.environ)
     env["HOME"] = env_home
+    # These tests exercise squire_report.py's own HOME-relative default ledger path (S4:
+    # conftest.py sets SQUIRE_LEDGER for the rest of the suite's isolation, which would otherwise
+    # override this test's synthetic ~/.squire/ledger.jsonl fixture and read the wrong file).
+    env.pop("SQUIRE_LEDGER", None)
     cmd = [sys.executable, REPORT, "--json"] + (extra_args or [])
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     assert p.returncode == 0, p.stdout

@@ -15,6 +15,10 @@ vLLM), so long output is condensed locally before a session reads it.
     squire triage <file>         order a HANDOFF-INBOX/BACKLOG by real age, with a guessed impact line
     squire stats                 real chars in/out logged, plus a labelled token estimate
     squire doctor                check backend, models and GPU; exit 0 ready, 2 UNKNOWN
+    squire submit <sum|ask|draft|diff|triage> [args...]   queue a job, print its id immediately
+    squire worker                 process queued jobs FIFO, one at a time (run as a service)
+    squire status <id> | squire wait <id> [--timeout S]   exit 0 RESULT, 1 FAIL, 2 WAIT, 3 UNKNOWN
+    squire jobs                   list queued/running/done/failed jobs
 
 Any command accepts --json to emit one JSON object instead of formatted text.
 
@@ -26,9 +30,10 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.6"
+__version__ = "0.2.10"
 
 import datetime as _dt
+import fcntl
 import json
 import math
 import os
@@ -45,11 +50,50 @@ OPENAI_BASE = os.environ.get("SQUIRE_OPENAI_BASE", "http://127.0.0.1:8080/v1")
 MODEL = os.environ.get("SQUIRE_MODEL", "qwen2.5:14b")
 EMBED_MODEL = os.environ.get("SQUIRE_EMBED_MODEL", "nomic-embed-text")
 CTX = int(os.environ.get("SQUIRE_CTX", "16384"))    # Ollama defaults to 2048, which truncates silently
-KEEP_ALIVE = os.environ.get("SQUIRE_KEEP_ALIVE", "30m")
+KEEP_ALIVE = os.environ.get("SQUIRE_KEEP_ALIVE", "2h")
 CHUNK = 24000            # chars per chunk (~6k tokens), leaves room for prompt + answer
 SHORT = 60               # lines at or below this are shown raw, no model call
 TAIL = 25
 LEDGER = os.path.expanduser(os.environ.get("SQUIRE_LEDGER", "~/.squire/ledger.jsonl"))
+# 2026-09-13 S4: which caller wrote this row -- cli (a human/session invocation), test (squire's
+# own pytest fixtures), hook (the PreToolUse wrap), queue (the S5 worker). Lets stats/report
+# exclude test noise from the real production ledger without ever deleting history.
+SOURCE = os.environ.get("SQUIRE_SOURCE", "cli")
+
+# 2026-09-13 S4: before the `source` field existed, squire's own test suite wrote its fixture
+# calls (DOWN backend, tiny fixed inputs) straight into the real ~/.squire/ledger.jsonl -- found
+# 2026-09-13 (S3-check) as 21 of 33 post-S1 rows being the SAME 7 fixture calls repeated across
+# test runs. These exact (cmd, chars_in, chars_out) triples are those fixtures' fixed, deterministic
+# shapes; matched only when backend_ok is False and `source` is absent (pre-S4 rows). This is a
+# backward-compatible exclusion for OLD rows only -- new rows always carry `source` and need no
+# guessing.
+LEGACY_TEST_FIXTURE_SIGNATURES = {
+    ("ask", 16492, 7), ("ask", 16681, 7), ("ask", 21453, 7), ("ask", 28351, 7), ("ask", 66678, 7),
+    ("diff", 101, 43), ("diff", 101, 91),
+    ("run", 1705, 43), ("run", 1705, 91), ("run", 1750, 91),
+    ("sum", 5, 128), ("sum", 10, 43), ("sum", 10, 91),
+    ("triage", 149, 0),
+}
+
+
+def is_test_row(row):
+    """True for a ledger row that should be excluded from stats/report as test noise, without
+    ever deleting it from the ledger file itself."""
+    if row.get("source") == "test":
+        return True
+    if row.get("source") is None and not row.get("backend_ok") and \
+            (row.get("cmd"), row.get("chars_in"), row.get("chars_out")) in LEGACY_TEST_FIXTURE_SIGNATURES:
+        return True
+    return False
+# 2026-09-13 S1 fix: a single 24GB GPU running qwen2.5:14b at num_ctx=16384 cannot serve several
+# multi-agent squire calls at once without either Ollama-side queueing (fine, bounded) or -- worse
+# -- GPU/CPU offload thrashing if it tries to run them concurrently, which is what a measured
+# single `sum` taking 272s under 4-agent load looks like. Client-side serialization (one in-flight
+# request to the backend at a time, FIFO across all local squire processes) trades a bounded queue
+# wait for eliminating that thrashing, and lets a lock-wait timeout fail fast and distinctly from a
+# real backend-down/generation error.
+LLM_LOCK_PATH = os.path.expanduser(os.environ.get("SQUIRE_LLM_LOCK", "~/.squire/llm.lock"))
+LLM_LOCK_TIMEOUT = float(os.environ.get("SQUIRE_LLM_LOCK_TIMEOUT", "240"))  # max queue wait, seconds
 CHARS_PER_TOKEN = 4      # rough estimate for English text; stats labels this explicitly as an estimate
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -88,19 +132,72 @@ def check_local(url):
         raise BackendError(f"backend host {host!r} is not localhost; set SQUIRE_ALLOW_HOSTS to allow it")
 
 
-def log_call(cmd, chars_in, chars_out, backend_ok):
+def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None, source=None, job=None,
+             status=None):
     # chars_in/out/ts are real, computed facts. The token estimate derived from them in `stats`
     # is NOT -- the two must never be presented as the same kind of claim.
+    # queue_wait_s/gen_s (2026-09-13, S1) split how long a call sat waiting for the local lock
+    # from how long the model actually took, so a slow "backend" can be told apart from a busy one.
+    # `job` (2026-09-13, S5, owner request ahead of the S6 benchmark) lets the queue worker attach
+    # the job id and its enqueue/start/finish timestamps to the SAME ledger schema the synchronous
+    # path writes, so S6 can compare sync vs queued using one set of rows.
+    # `status` (2026-09-13, S10) records WHY a call failed (e.g. "timeout") separately from
+    # `source` (which is provenance: cli/test/queue) so a stuck call is visible to
+    # squire_usage_report.py as a distinct, named outcome instead of just backend_ok=False.
+    row = {"ts": time.time(), "cmd": cmd, "chars_in": chars_in, "chars_out": chars_out,
+           "backend_ok": backend_ok, "queue_wait_s": queue_wait_s, "gen_s": gen_s,
+           "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "source": source or SOURCE,
+           "status": status}
+    if job:
+        row.update(job_id=job["id"], enqueued_at=job["enqueued_at"], started_at=job["started_at"],
+                   finished_at=job["finished_at"])
     try:
         os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
         with open(LEDGER, "a") as f:
-            # session lets scripts/squire_report.py multiply chars avoided by that session's
-            # remaining turns (each later turn re-reads context) instead of guessing.
-            f.write(json.dumps({"ts": time.time(), "cmd": cmd, "chars_in": chars_in,
-                                "chars_out": chars_out, "backend_ok": backend_ok,
-                                "session": os.environ.get("CLAUDE_CODE_SESSION_ID")}) + "\n")
+            f.write(json.dumps(row) + "\n")
     except OSError:
         pass  # stats are a bonus; never fail the actual command over a logging error
+
+
+class _LlmLock:
+    """Serializes actual network calls to the local model backend across all squire processes
+    on this workstation (flock on a shared file). One in-flight generate/embed call at a time
+    avoids Ollama trying to run several large-context requests concurrently on one GPU, which
+    degrades into GPU/CPU offload thrashing rather than clean queueing. Gives up after
+    LLM_LOCK_TIMEOUT seconds of waiting rather than blocking forever; the caller decides what a
+    failed acquisition means (fail fast, labelled distinctly from a generation-time failure)."""
+
+    def __enter__(self):
+        self.wait_s = 0.0
+        self._f = None
+        try:
+            os.makedirs(os.path.dirname(LLM_LOCK_PATH), mode=0o700, exist_ok=True)
+            self._f = open(LLM_LOCK_PATH, "a+")
+        except OSError:
+            return self  # no lock available (e.g. read-only fs); proceed unserialized
+        start = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                break
+            except BlockingIOError:
+                self.wait_s = time.monotonic() - start
+                if self.wait_s >= LLM_LOCK_TIMEOUT:
+                    self.acquired = False
+                    break
+                time.sleep(0.25)
+        self.wait_s = time.monotonic() - start
+        return self
+
+    def __exit__(self, *exc):
+        if self._f is not None:
+            try:
+                if getattr(self, "acquired", False):
+                    fcntl.flock(self._f, fcntl.LOCK_UN)
+            finally:
+                self._f.close()
+        return False
 
 
 def _post(url, payload, timeout=300):
@@ -158,22 +255,46 @@ def model():
     return _resolved_model
 
 
+# Cumulative queue-wait/generation time across a whole squire invocation (condense() may issue
+# several llm() calls for chunking + a combine pass). reset_call_timing() zeroes it; callers read
+# it back after their work to pass real, measured numbers into log_call (2026-09-13, S1).
+_call_timing_totals = {"queue_wait_s": 0.0, "gen_s": 0.0}
+
+
+def reset_call_timing():
+    _call_timing_totals["queue_wait_s"] = 0.0
+    _call_timing_totals["gen_s"] = 0.0
+
+
+def get_call_timing():
+    return round(_call_timing_totals["queue_wait_s"], 2), round(_call_timing_totals["gen_s"], 2)
+
+
 def llm(prompt, max_tokens=300):
     prompt = redact(prompt)
-    try:
-        if BACKEND == "openai":
-            data = _post(OPENAI_BASE.rstrip("/") + "/chat/completions",
-                         {"model": model(), "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": max_tokens, "temperature": 0.1})
-            return data["choices"][0]["message"]["content"].strip()
-        # keep_alive holds the model in VRAM between calls: a cold load (~75s for 14B) inside a
-        # hook-wrapped test run can push the command past the caller's timeout.
-        data = _post(HOST + "/api/generate", {"model": model(), "prompt": prompt, "stream": False,
-                     "keep_alive": KEEP_ALIVE,
-                     "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}})
-        return data.get("response", "").strip()
-    except Exception as e:  # noqa: BLE001 - any failure is reported, never swallowed
-        return f"UNKNOWN: local model unavailable ({type(e).__name__}: {e})"[:300]
+    with _LlmLock() as lock:
+        _call_timing_totals["queue_wait_s"] += lock.wait_s
+        if not getattr(lock, "acquired", True):
+            # Distinct from a backend-down/generation error: the backend is fine, this call just
+            # never got a turn. Fails fast instead of also burning a full HTTP timeout on top.
+            return f"UNKNOWN: local model busy (queued {round(lock.wait_s, 1)}s, gave up)"[:300]
+        gen_start = time.monotonic()
+        try:
+            if BACKEND == "openai":
+                data = _post(OPENAI_BASE.rstrip("/") + "/chat/completions",
+                             {"model": model(), "messages": [{"role": "user", "content": prompt}],
+                              "max_tokens": max_tokens, "temperature": 0.1})
+                return data["choices"][0]["message"]["content"].strip()
+            # keep_alive holds the model in VRAM between calls: a cold load (~75s for 14B) inside a
+            # hook-wrapped test run can push the command past the caller's timeout.
+            data = _post(HOST + "/api/generate", {"model": model(), "prompt": prompt, "stream": False,
+                         "keep_alive": KEEP_ALIVE,
+                         "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}})
+            return data.get("response", "").strip()
+        except Exception as e:  # noqa: BLE001 - any failure is reported, never swallowed
+            return f"UNKNOWN: local model unavailable ({type(e).__name__}: {e})"[:300]
+        finally:
+            _call_timing_totals["gen_s"] += time.monotonic() - gen_start
 
 
 def embed(texts, kind="document"):
@@ -183,11 +304,19 @@ def embed(texts, kind="document"):
         # nomic-embed-text is trained with task prefixes; without them ranking is noticeably worse.
         texts = [f"search_{kind}: {t}" for t in texts]
     try:
-        if BACKEND == "openai":
-            data = _post(OPENAI_BASE.rstrip("/") + "/embeddings", {"model": EMBED_MODEL, "input": texts}, 600)
-            return [d["embedding"] for d in data["data"]]
-        data = _post(HOST + "/api/embed", {"model": EMBED_MODEL, "input": texts}, 600)
-        return data["embeddings"]
+        with _LlmLock() as lock:
+            _call_timing_totals["queue_wait_s"] += lock.wait_s
+            if not getattr(lock, "acquired", True):
+                raise BackendError(f"local model busy (queued {round(lock.wait_s, 1)}s, gave up)")
+            gen_start = time.monotonic()
+            try:
+                if BACKEND == "openai":
+                    data = _post(OPENAI_BASE.rstrip("/") + "/embeddings", {"model": EMBED_MODEL, "input": texts}, 600)
+                    return [d["embedding"] for d in data["data"]]
+                data = _post(HOST + "/api/embed", {"model": EMBED_MODEL, "input": texts}, 600)
+                return data["embeddings"]
+            finally:
+                _call_timing_totals["gen_s"] += time.monotonic() - gen_start
     except BackendError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -272,8 +401,27 @@ def cmd_run(argv):
         json_mode, argv = pop_flag(argv, "--json")
     if not argv:
         sys.exit("usage: squire run [--json] -- <command...>")
-    p = subprocess.run(argv if len(argv) > 1 else argv[0], shell=len(argv) == 1,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    # stdin=DEVNULL: a nested launcher (docker -i, ssh, flatpak-spawn --host ...) that attaches
+    # stdin will otherwise inherit whatever fd squire itself got. In an interactive shell that fd
+    # is a live tty/pipe that never reaches EOF, so the nested process blocks waiting for input
+    # that is never coming -- squire "hangs" with no exit code and no output, which from the
+    # caller's side is indistinguishable from squire being broken (found 2026-09-13, S2: "squire
+    # run breaks on nested flatpak-spawn/docker invocations"). squire's contract is capture-then-
+    # summarize, never interactive, so stdin is never useful here -- close it up front.
+    timeout_s = float(os.environ.get("SQUIRE_RUN_TIMEOUT", "0") or 0) or None
+    try:
+        p = subprocess.run(argv if len(argv) > 1 else argv[0], shell=len(argv) == 1,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           errors="replace", stdin=subprocess.DEVNULL, timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        # Still surface everything captured before the kill, and a real, non-zero, documented
+        # exit code (124, the shell convention for `timeout`) -- never silence, per squire's rule.
+        out = (e.output or "") if isinstance(e.output, str) else (e.output or b"").decode("utf-8", "replace")
+        out += f"\n[squire] killed after {timeout_s}s (SQUIRE_RUN_TIMEOUT)\n"
+        if not json_mode:
+            print(f"[squire] exit=124 lines={len(out.splitlines())} (timeout)")
+        emit("run", 124, out, None, True, json_mode)
+        sys.exit(124)
     out = p.stdout or ""
     lines = out.splitlines()
     if not json_mode:
@@ -283,11 +431,13 @@ def cmd_run(argv):
     else:
         if not json_mode:
             print(f"[squire] --- raw tail ({TAIL} lines) ---")
+        reset_call_timing()
         summary, flag = condense_verified(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
                                           "List every failing test/error with file:line and the one-line cause. "
                                           "Say 'no errors seen' only if there are none. Never invent names.")
         ok = not summary.startswith("UNKNOWN")
-        log_call("run", len(out), len(summary), ok)
+        wait_s, gen_s = get_call_timing()
+        log_call("run", len(out), len(summary), ok, wait_s, gen_s)
         emit("run", p.returncode, "\n".join(lines[-TAIL:]), summary, ok, json_mode, flag)
     sys.exit(p.returncode)
 
@@ -310,10 +460,12 @@ def cmd_diff(argv):
     if not diff_text.strip():
         emit("diff", 0, "(no diff)", None, True, json_mode)
         return
+    reset_call_timing()
     summary, flag = condense_verified(diff_text, "Summarize this git diff by file/module. Separate logic changes "
                                       "from formatting/rename-only changes. Be factual, keep exact file paths and names.")
     ok = not summary.startswith("UNKNOWN")
-    log_call("diff", len(diff_text), len(summary), ok)
+    wait_s, gen_s = get_call_timing()
+    log_call("diff", len(diff_text), len(summary), ok, wait_s, gen_s)
     if not json_mode:
         print(f"[squire] {stat.splitlines()[-1] if stat else '(no stat)'}")
     emit("diff", 0, stat, summary, ok, json_mode, flag)
@@ -408,6 +560,7 @@ def cmd_grep(argv):
         except (OSError, ValueError):
             cache = {}
     header = {"root": root, "files_indexed": len(files), "git": in_git}
+    grep_t0 = time.monotonic()
     try:
         todo = []
         for rel, mtime, size in files:
@@ -440,6 +593,13 @@ def cmd_grep(argv):
                 exclude_cache(root)
         qv = _norm(embed([query])[0])
     except BackendError as e:
+        # A stuck/timed-out embedding call used to die here with NO ledger row at all -- from
+        # the ledger's side a stuck `squire grep` was indistinguishable from one never run
+        # (found 2026-09-13, S10). Always log a row on this path, same as the success path
+        # below, so squire_usage_report.py can see it instead of it going silently absent.
+        grep_dur = round(time.monotonic() - grep_t0, 1)
+        fail_status = "timeout" if "timeout" in str(e).lower() else "error"
+        log_call("grep", sum(f[2] for f in files), 0, False, gen_s=grep_dur, status=fail_status)
         header.update(error=f"UNKNOWN: embedding backend unavailable ({e}); try `ollama pull {EMBED_MODEL}`")
         if json_mode:
             print(json.dumps({"cmd": "grep", **header, "results": None, "backend_ok": False}))
@@ -507,11 +667,9 @@ def age_days(ts, now=None):
     return round((now - d).total_seconds() / 86400, 1)
 
 
-def cmd_triage(argv):
-    json_mode, argv = pop_flag(argv, "--json")
-    if not argv:
-        sys.exit("usage: squire triage <file> [--json]")
-    text = read_input(argv[0])
+def compute_triage(text):
+    """Core of `triage`: parse open items, order by real age, guess urgency per item. Shared by
+    the CLI command and the S5 queue worker so the two never diverge."""
     items = [i for i in parse_items(text) if i["status"] not in ("DONE", "RESOLVED", "CLOSED")]
     for i in items:
         i["age_days"] = age_days(i["ts"])
@@ -532,7 +690,18 @@ def cmd_triage(argv):
         backend_ok = True
     for n, i in enumerate(items):
         i["guess"] = guesses.get(n) if backend_ok else None
-    log_call("triage", len(text), sum(len(i.get("guess") or "") for i in items), backend_ok)
+    return items, backend_ok
+
+
+def cmd_triage(argv):
+    json_mode, argv = pop_flag(argv, "--json")
+    if not argv:
+        sys.exit("usage: squire triage <file> [--json]")
+    text = read_input(argv[0])
+    reset_call_timing()
+    items, backend_ok = compute_triage(text)
+    wait_s, gen_s = get_call_timing()
+    log_call("triage", len(text), sum(len(i.get("guess") or "") for i in items), backend_ok, wait_s, gen_s)
     if json_mode:
         print(json.dumps({"cmd": "triage", "open_items": [{k: v for k, v in i.items() if k != "body"} for i in items],
                           "backend_ok": backend_ok, "assumed_fields": ["guess"]}))
@@ -547,13 +716,306 @@ def cmd_triage(argv):
             print(f"    squire: {i['guess']}")
 
 
+# ---------------------------------------------------------------- S5: job queue
+# A SQLite spool so a session can `squire submit` a slow sum/ask/draft/diff/triage call and get a
+# job id back immediately, instead of blocking on the _LlmLock queue in the foreground. A single
+# `squire worker` processes jobs FIFO, reusing the exact same condense/llm code the synchronous
+# commands use (and the same _LlmLock), so results are identical either way -- the queue changes
+# WHEN the work happens, never what it computes. The synchronous commands are untouched (owner,
+# 2026-09-13 mid-task note: S6 will benchmark sync vs queued, so the sync path must not change).
+import sqlite3
+
+QUEUE_DB = os.path.expanduser(os.environ.get("SQUIRE_QUEUE_DB", "~/.squire/queue.db"))
+WORKER_HEARTBEAT = os.path.expanduser(os.environ.get("SQUIRE_WORKER_HEARTBEAT", "~/.squire/worker.heartbeat"))
+HEARTBEAT_STALE_S = float(os.environ.get("SQUIRE_HEARTBEAT_STALE_S", "15"))
+WORKER_POLL_S = float(os.environ.get("SQUIRE_WORKER_POLL_S", "1.0"))
+QUEUE_CMDS = ("sum", "ask", "draft", "diff", "triage")  # the commands a queued job may run
+
+
+def _queue_conn():
+    os.makedirs(os.path.dirname(QUEUE_DB), mode=0o700, exist_ok=True)
+    conn = sqlite3.connect(QUEUE_DB, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cmd TEXT NOT NULL,
+        args TEXT NOT NULL,
+        input_text TEXT,
+        cwd TEXT,
+        status TEXT NOT NULL DEFAULT 'queued',
+        enqueued_at REAL NOT NULL,
+        started_at REAL,
+        finished_at REAL,
+        result TEXT,
+        error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        worker_pid INTEGER,
+        queue_wait_s REAL,
+        gen_s REAL
+    )""")
+    return conn
+
+
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _worker_alive():
+    try:
+        hb = json.load(open(WORKER_HEARTBEAT))
+        return _pid_alive(hb.get("pid")) and (time.time() - hb.get("ts", 0)) < HEARTBEAT_STALE_S
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _write_heartbeat():
+    try:
+        os.makedirs(os.path.dirname(WORKER_HEARTBEAT), mode=0o700, exist_ok=True)
+        with open(WORKER_HEARTBEAT, "w") as f:
+            json.dump({"pid": os.getpid(), "ts": time.time()}, f)
+    except OSError:
+        pass
+
+
+def cmd_submit(argv):
+    json_mode, argv = pop_flag(argv, "--json")
+    if not argv or argv[0] not in QUEUE_CMDS:
+        sys.exit(f"usage: squire submit <{'|'.join(QUEUE_CMDS)}> [args...] [--json]")
+    cmd, rest = argv[0], argv[1:]
+    # Capture any file/stdin input NOW: a worker running later (possibly as a separate systemd
+    # service) has no access to this process's stdin or its file descriptors.
+    extra_args, input_text, cwd = [], None, None
+    if cmd == "sum":
+        input_text = read_input(rest[0] if rest else None)
+    elif cmd == "ask":
+        if not rest:
+            sys.exit('usage: squire submit ask "question" [file|-]')
+        extra_args, input_text = [rest[0]], read_input(rest[1] if len(rest) > 1 else None)
+    elif cmd == "draft":
+        if not rest:
+            sys.exit('usage: squire submit draft "instructions" [file|-]')
+        extra_args = [rest[0]]
+        input_text = read_input(rest[1]) if len(rest) > 1 else ""
+    elif cmd == "triage":
+        if not rest:
+            sys.exit("usage: squire submit triage <file>")
+        input_text = read_input(rest[0])
+    elif cmd == "diff":
+        extra_args, cwd = list(rest), os.getcwd()  # git state is read fresh by the worker
+    conn = _queue_conn()
+    now = time.time()
+    cur = conn.execute("INSERT INTO jobs (cmd, args, input_text, cwd, status, enqueued_at, attempts) "
+                       "VALUES (?,?,?,?,'queued',?,0)",
+                       (cmd, json.dumps(extra_args), input_text, cwd, now))
+    conn.commit()
+    job_id = cur.lastrowid
+    conn.close()
+    if json_mode:
+        print(json.dumps({"cmd": "submit", "job_id": job_id, "status": "queued"}))
+    else:
+        print(f"[squire] submitted job {job_id} ({cmd}), queued")
+
+
+def _run_queued_job(row):
+    """Execute one job's actual work, reusing the same code the synchronous commands call.
+    Returns (ok, output_or_error)."""
+    cmd, args, text = row["cmd"], json.loads(row["args"]), row["input_text"] or ""
+    if cmd == "sum":
+        out = condense(text, "Condense to at most 8 factual bullets. Keep numbers, names, paths exact.")
+    elif cmd == "ask":
+        out = condense(text, f"Answer using ONLY this text; say UNKNOWN if it is not there. Question: {args[0]}")
+    elif cmd == "draft":
+        out = llm(f"{args[0]}\n\nSource material (may be empty):\n{text[:CHUNK]}", 1200)
+    elif cmd == "triage":
+        items, backend_ok = compute_triage(text)
+        out = ("UNKNOWN: local model unavailable" if not backend_ok else
+               "\n".join(f"[AGE: {i['age_days']}d] [{i['status']}] {i['heading']}"
+                        + (f"\n    squire: {i['guess']}" if i['guess'] else "") for i in items))
+    elif cmd == "diff":
+        gitcmd = ["git", "-C", row["cwd"] or "."]
+        gitcmd += ["diff", "--staged"] if args[:1] == ["--staged"] else \
+                  (["diff", args[0], args[1]] if len(args) >= 2 else ["diff"])
+        p = subprocess.run(gitcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        diff_text = p.stdout or ""
+        out = "(no diff)" if not diff_text.strip() else condense_verified(diff_text,
+              "Summarize this git diff by file/module. Separate logic changes from formatting/rename-only "
+              "changes. Be factual, keep exact file paths and names.")[0]
+    else:
+        return False, f"unknown queued command {cmd!r}"
+    return not out.startswith("UNKNOWN"), out
+
+
+def _requeue_dead_workers(conn):
+    for row in conn.execute("SELECT id, worker_pid FROM jobs WHERE status='running'"):
+        if not _pid_alive(row["worker_pid"]):
+            conn.execute("UPDATE jobs SET status='queued', worker_pid=NULL, started_at=NULL, "
+                        "attempts=attempts+1 WHERE id=? AND status='running'", (row["id"],))
+    conn.commit()
+
+
+def _claim_next_job(conn):
+    _requeue_dead_workers(conn)
+    row = conn.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE jobs SET status='running', started_at=?, worker_pid=? WHERE id=? AND status='queued'",
+                (time.time(), os.getpid(), row["id"]))
+    conn.commit()
+    return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone() if conn.total_changes else None
+
+
+def cmd_worker(argv):
+    _once, argv = pop_flag(argv, "--once")  # process at most one job then exit; for tests/CI
+    conn = _queue_conn()
+    print(f"[squire] worker started, pid={os.getpid()}, db={QUEUE_DB}")
+    while True:
+        _write_heartbeat()
+        job = _claim_next_job(conn)
+        if job is None:
+            if _once:
+                return
+            time.sleep(WORKER_POLL_S)
+            continue
+        reset_call_timing()
+        try:
+            ok, out = _run_queued_job(job)
+            error = None if ok else out
+            result = out if ok else None
+        except Exception as e:  # noqa: BLE001 -- a job must never crash the worker loop
+            ok, result, error = False, None, f"{type(e).__name__}: {e}"
+        wait_s, gen_s = get_call_timing()
+        finished = time.time()
+        conn.execute("UPDATE jobs SET status=?, result=?, error=?, finished_at=?, queue_wait_s=?, gen_s=? "
+                    "WHERE id=?",
+                    ("done" if ok else "failed", result, error, finished, wait_s, gen_s, job["id"]))
+        conn.commit()
+        finished_job = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        log_call(f"queue:{job['cmd']}", len(job["input_text"] or ""), len(result or error or ""), ok,
+                 wait_s, gen_s, source="queue", job=finished_job)
+        if _once:
+            return
+
+
+def _job_position(conn, job):
+    if job["status"] != "queued":
+        return 0
+    row = conn.execute("SELECT COUNT(*) c FROM jobs WHERE status='queued' AND id<?", (job["id"],)).fetchone()
+    return row["c"] + 1
+
+
+def _job_age(job):
+    return round(time.time() - job["enqueued_at"], 1)
+
+
+def _emit_job_state(job, conn, json_mode):
+    if job["status"] == "done":
+        if json_mode:
+            print(json.dumps({"cmd": "status", "id": job["id"], "state": "RESULT", "result": job["result"]}))
+        else:
+            print(job["result"])
+        return 0
+    if job["status"] == "failed":
+        if json_mode:
+            print(json.dumps({"cmd": "status", "id": job["id"], "state": "FAIL", "error": job["error"]}))
+        else:
+            print(f"[squire] FAIL: {job['error']}")
+        return 1
+    alive = _worker_alive()
+    pos, age = _job_position(conn, job), _job_age(job)
+    if not alive:
+        if json_mode:
+            print(json.dumps({"cmd": "status", "id": job["id"], "state": "UNKNOWN",
+                              "reason": "no worker heartbeat", "position": pos, "age_s": age}))
+        else:
+            print(f"[squire] UNKNOWN: no worker heartbeat (job {job['id']} {job['status']}, "
+                 f"position {pos}, age {age}s)")
+        return 3
+    if json_mode:
+        print(json.dumps({"cmd": "status", "id": job["id"], "state": "WAIT", "status": job["status"],
+                          "position": pos, "age_s": age}))
+    else:
+        print(f"[squire] WAIT: job {job['id']} {job['status']}, position {pos}, age {age}s")
+    return 2
+
+
+def _parse_job_id(raw, usage):
+    # argv[0] can be "" (an empty positional slipped through, e.g. `squire status ''`) or any
+    # other non-numeric junk. int("") / int("abc") raise an uncaught ValueError that crashes with
+    # a Python traceback instead of squire's own clean usage error -- found 2026-09-13 (S10/S7).
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        sys.exit(f"usage: {usage} (id must be a job number, got {raw!r})")
+
+
+def cmd_status(argv):
+    json_mode, argv = pop_flag(argv, "--json")
+    if not argv:
+        sys.exit("usage: squire status <id> [--json]")
+    job_id = _parse_job_id(argv[0], "squire status <id> [--json]")
+    conn = _queue_conn()
+    job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if job is None:
+        sys.exit(f"job {argv[0]} not found")
+    sys.exit(_emit_job_state(job, conn, json_mode))
+
+
+def cmd_wait(argv):
+    json_mode, argv = pop_flag(argv, "--json")
+    timeout, argv = pop_opt(argv, "--timeout", "300")
+    if not argv:
+        sys.exit("usage: squire wait <id> [--timeout S] [--json]")
+    job_id = _parse_job_id(argv[0], "squire wait <id> [--timeout S] [--json]")
+    timeout = float(timeout)
+    conn = _queue_conn()
+    deadline = time.monotonic() + timeout
+    while True:
+        job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job is None:
+            sys.exit(f"job {job_id} not found")
+        if job["status"] in ("done", "failed"):
+            sys.exit(_emit_job_state(job, conn, json_mode))
+        if not _worker_alive():
+            sys.exit(_emit_job_state(job, conn, json_mode))  # UNKNOWN -- no point waiting further
+        if time.monotonic() >= deadline:
+            sys.exit(_emit_job_state(job, conn, json_mode))  # WAIT -- still queued/running
+        time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+
+
+def cmd_jobs(argv):
+    json_mode, _ = pop_flag(argv, "--json")
+    conn = _queue_conn()
+    rows = [dict(r) for r in conn.execute("SELECT id, cmd, status, enqueued_at, started_at, finished_at, "
+                                          "attempts FROM jobs ORDER BY id")]
+    if json_mode:
+        print(json.dumps({"cmd": "jobs", "jobs": rows}))
+        return
+    if not rows:
+        print("[squire] no jobs")
+        return
+    for r in rows:
+        print(f"[{r['id']:>4}] {r['status']:8} {r['cmd']:6} enqueued {round(time.time() - r['enqueued_at'], 1)}s ago"
+             + (f", attempts={r['attempts']}" if r["attempts"] else ""))
+
+
 # ---------------------------------------------------------------- stats / doctor
 
 def cmd_stats(argv):
     json_mode, _ = pop_flag(argv, "--json")
     rows = []
     if os.path.exists(LEDGER):
-        rows = [json.loads(ln) for ln in open(LEDGER) if ln.strip()]
+        all_rows = [json.loads(ln) for ln in open(LEDGER) if ln.strip()]
+        rows = [r for r in all_rows if not is_test_row(r)]
+        excluded_test = len(all_rows) - len(rows)
+    else:
+        excluded_test = 0
     total_in = sum(r["chars_in"] for r in rows)
     total_out = sum(r["chars_out"] for r in rows)
     ok = sum(1 for r in rows if r["backend_ok"])
@@ -567,13 +1029,15 @@ def cmd_stats(argv):
     if json_mode:
         print(json.dumps({"cmd": "stats", "ledger": LEDGER, "calls": len(rows), "backend_ok_calls": ok,
                           "chars_in": total_in, "chars_out": total_out, "chars_saved": total_in - total_out,
-                          "by_cmd": by_cmd, "estimated_tokens_saved": est,
+                          "by_cmd": by_cmd, "estimated_tokens_saved": est, "excluded_test_rows": excluded_test,
                           "estimate_method": f"chars/{CHARS_PER_TOKEN}, per-read only; not a measured token count"}))
         return
     if not rows:
-        print("[squire] no ledger entries yet -- run some commands first")
+        print(f"[squire] no ledger entries yet -- run some commands first"
+              + (f" ({excluded_test} test rows excluded)" if excluded_test else ""))
         return
-    print(f"[squire] {len(rows)} calls logged ({ok} backend-ok, {len(rows) - ok} UNKNOWN) -- REAL, computed from {LEDGER}")
+    print(f"[squire] {len(rows)} calls logged ({ok} backend-ok, {len(rows) - ok} UNKNOWN) -- REAL, computed from {LEDGER}"
+          + (f" ({excluded_test} test rows excluded, not deleted)" if excluded_test else ""))
     for name, c in sorted(by_cmd.items()):
         print(f"  {name:7} calls={c['calls']:<5} chars in={c['chars_in']} out={c['chars_out']}")
     print(f"[squire] chars in={total_in} out={total_out} saved={total_in - total_out} (REAL character counts)")
@@ -628,10 +1092,12 @@ def main():
     cmd, rest = sys.argv[1], sys.argv[2:]
     if cmd == "run":
         return cmd_run(rest)
-    handlers = {"diff": cmd_diff, "grep": cmd_grep, "triage": cmd_triage, "stats": cmd_stats, "doctor": cmd_doctor}
+    handlers = {"diff": cmd_diff, "grep": cmd_grep, "triage": cmd_triage, "stats": cmd_stats, "doctor": cmd_doctor,
+                "submit": cmd_submit, "worker": cmd_worker, "status": cmd_status, "wait": cmd_wait, "jobs": cmd_jobs}
     if cmd in handlers:
         return handlers[cmd](rest)
     json_mode, rest = pop_flag(rest, "--json")
+    reset_call_timing()
     if cmd == "sum":
         text = read_input(rest[0] if rest else None)
         out = condense(text, "Condense to at most 8 factual bullets. Keep numbers, names, paths exact.")
@@ -648,7 +1114,8 @@ def main():
     else:
         sys.exit(f"unknown command {cmd!r}; see squire --help")
     ok = not out.startswith("UNKNOWN")
-    log_call(cmd, len(text), len(out), ok)
+    wait_s, gen_s = get_call_timing()
+    log_call(cmd, len(text), len(out), ok, wait_s, gen_s)
     if json_mode:
         print(json.dumps({"cmd": cmd, "exit_code": None, "raw_tail": None, "summary": out,
                           "assumed": True, "backend_ok": ok, "verify_flag": None}))
