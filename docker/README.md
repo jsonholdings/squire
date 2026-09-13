@@ -84,7 +84,7 @@ docker compose down -v         # also delete the model/ledger volumes
   (e.g. 11435) before bringing the stack up.
 - `SQUIRE_MODEL` / `SQUIRE_EMBED_MODEL` env vars override the pulled models;
   keep them consistent between `model-pull` and `squire`.
-- Per squire's design (see `../squire.py` header, `../CLAUDE.md` §5.8): the
+- Per squire's design (see the `../squire.py` header and the README's Guarantees): the
   exit code and raw tail of any wrapped command are always real; model output
   is a local, ASSUMED-until-checked summary, never a pass/fail or security
   decision.

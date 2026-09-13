@@ -45,9 +45,12 @@ process from the Claude Code transcript), so that correlation cannot be computed
 gap would mean adding a session-id field to ledger entries, written by whatever wraps squire calls
 inside a session (the planned PostToolUse hook is the natural place for it).
 
-## What was actually measured on this machine (2026-09-12)
+## An earlier snapshot (2026-09-12, superseded)
 
-**VERIFIED**, one project, 34 sessions, from real `usage` blocks:
+> Superseded by [`SAVINGS.md`](SAVINGS.md), which covers all 186 recorded sessions and 125 ledger
+> calls with session correlation. It's kept here only to show how the numbers grew.
+
+**MEASURED**, one project, 34 sessions, from real `usage` blocks:
 
 | Metric | Value |
 |---|---|
@@ -60,7 +63,7 @@ inside a session (the planned PostToolUse hook is the natural place for it).
 Reproduce with `python3 scripts/squire_report.py --project <that project's dir name>`. Names are
 withheld here per the scrub policy; run the command yourself to see your own project names.
 
-**ESTIMATE**, squire's ledger on this machine, 23 calls logged so far:
+**ESTIMATED**, squire's ledger at that point, 23 calls logged:
 chars_in=10,893, chars_out=1,552, chars_saved=9,341, tokens_saved_one_time_ESTIMATE=2,335.
 Small because the ledger is new — it grows with use, and the multiplier gap above means even this
 figure understates the real saving (each avoided paste would otherwise be re-read on every later

@@ -43,8 +43,8 @@ Always prints, un-labelled, the literal command run and how many files/chunks we
 search that covered zero files can never look identical to one that covered everything and found
 nothing. Caches embeddings under `<repo>/.squire-cache/`, added to `.git/info/exclude` (never
 `.gitignore`); `--reindex` forces a full re-embed. VERIFIED this session on a 55-file repo: cold
-index 2.9s for 32 chunks. The eval worker separately measured 43s cold / 8.7s warm on a
-143-chunk repo — relayed here, not independently reverified; re-run on your own repo before
+index 2.9s for 32 chunks. A separate run measured 43s cold / 8.7s warm on a
+143-chunk repo; re-run on your own repo before
 citing a number as your own. Full contract: `SPEC-LOCAL-OFFLOAD-TOOLING.md` §1.
 
 ## `squire triage <file> [--json]`

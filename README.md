@@ -48,11 +48,11 @@ compose, an MCP server, hooks, and a live accuracy eval are built — see the ta
 
 ## Why
 
-Anthropic's own usage accounting shows the shape of the problem: on one real, measured Claude Code
-project on this machine, 34 sessions totalling 70,030 turns carried **21.7 billion cache-read
-tokens** against only 785k billed input tokens and 78.0 million output tokens (VERIFIED,
-2026-09-12 — see [`docs/measuring-savings.md`](docs/measuring-savings.md) for the exact command
-and full breakdown). Cache-read tokens are context being paid for again on every turn. A large
+Claude Code's own recorded usage shows the shape of the problem: across 186 real sessions
+(70,352 turns), the usage blocks sum to **21.77 billion cache-read tokens** against only 792k
+uncached input tokens and 78.6 million output tokens (MEASURED, 2026-09-12; see
+[`docs/SAVINGS.md`](docs/SAVINGS.md) for the full table and the command that reproduces it).
+Cache-read tokens are context being paid for again on every turn. A large
 tool result or log paste that never needed to enter context in full is the single biggest lever
 available to shrink that number.
 
@@ -95,9 +95,10 @@ Tested via the local-checkout equivalent (`pip install <path>` in a clean venv) 
 
 **3. Clone + editable local install**
 ```sh
-git clone git@github.com:jsonholdings/squire.git
+git clone https://github.com/jsonholdings/squire.git
 cd squire && pip install -e .
 ```
+(SSH instead: `git clone git@github.com:jsonholdings/squire.git`.)
 Tested against a local clone of this checkout — clone exit 0, `pip install -e .` exit 0.
 
 **4. Docker**
@@ -109,9 +110,9 @@ squire), `docker compose -f docker-compose.yml up` (GPU) or add `-f docker-compo
 CPU-only — the compose files themselves validate (`docker compose ... config`, exit 0); a full
 `up` wasn't run live here to avoid an unattended multi-GB pull. See `docker/README.md`.
 
-**5. Register with Claude Code (MCP)**
+**5. Register with Claude Code (MCP)**, run from inside the clone:
 ```sh
-claude mcp add squire -- python3 mcp/squire_mcp.py
+claude mcp add squire -- python3 "$PWD/mcp/squire_mcp.py"
 ```
 Not live-registered in this environment; verified instead that `mcp/squire_mcp.py` completes a
 real MCP `initialize` handshake (protocol 2025-06-18) over stdio, exit 0. Confirm registration
@@ -164,7 +165,7 @@ All commands below are implemented in `squire.py` (verified via `squire --help`,
 | `squire ask "question" [file\|-]` | Answers strictly from the given text; says `UNKNOWN` if the answer isn't in it. |
 | `squire draft "instructions" [file\|-]` | Produces a first draft for a human/Claude to review and correct — never used as-is. |
 | `squire diff [--staged] \| squire diff <ref1> <ref2>` | Always prints the real `git diff --stat` line first, then a condensed summary separating logic changes from formatting/rename-only changes. Never used to decide whether a diff is safe to commit. |
-| `squire grep "query" [path] [--top N] [--reindex]` | Local semantic search over a repo using embeddings (`SQUIRE_EMBED_MODEL`, default `nomic-embed-text`), cached in `<repo>/.squire-cache/` (added to `.git/info/exclude`, never `.gitignore`). Always prints how many files/chunks were indexed. VERIFIED (this session, 55-file repo): cold index 2.9s for 32 chunks; the eval worker separately measured 43s cold / 8.7s warm on a 143-chunk repo (relayed, not independently reverified here — re-run on your own repo to confirm). |
+| `squire grep "query" [path] [--top N] [--reindex]` | Local semantic search over a repo using embeddings (`SQUIRE_EMBED_MODEL`, default `nomic-embed-text`), cached in `<repo>/.squire-cache/` (added to `.git/info/exclude`, never `.gitignore`). Always prints how many files/chunks were indexed. VERIFIED (this session, 55-file repo): cold index 2.9s for 32 chunks; a separate run measured 43s cold / 8.7s warm on a 143-chunk repo (re-run on your own repo to confirm). |
 | `squire triage <file>` | Reorders a HANDOFF-INBOX/BACKLOG-shaped file oldest-open-first using a real, computed age, plus a one-line ASSUMED impact guess per item, visually separated from the computed part. |
 | `squire stats` | Reports real chars in/out from `~/.squire/ledger.jsonl`, plus a token estimate labelled ESTIMATE (chars/4 heuristic) — cross-check with `scripts/squire_report.py` before citing a token figure. |
 | `squire doctor [--json]` | Checks backend reachability and model availability. Exit 0 = ready, 2 = `UNKNOWN`. |
@@ -182,7 +183,9 @@ stripped before any prompt or embedding request leaves the process. Full contrac
 
 ## Claude Code integration
 
-- Call squire directly from a session (global `CLAUDE.md` §5.8).
+- Call squire directly from a session: add a line to your `CLAUDE.md` telling the agent to route
+  noisy commands through `squire run --` and long files through `squire sum` / `squire ask`
+  (see [`integrations/CLAUDE-snippet.md`](integrations/CLAUDE-snippet.md)).
 - `hooks/pretool_wrap.py` — a PreToolUse hook that rewrites noisy build/test/lint commands to run
   through `squire run` before execution, so only the condensed output ever reaches the model. This
   is the hook that actually saves tokens; `hooks/posttool_condense.py` is kept opt-in and
@@ -206,7 +209,7 @@ session). Full write-up with current numbers, method and honest limits:
 cache-read tokens outnumber uncached input by roughly 27,500:1 (MEASURED), and squire's own ledger
 shows 96% of the characters sent to it were kept out of context entirely (MEASURED chars saved),
 with an ESTIMATED 18.7M cache-read tokens avoided across the 38% of calls correlated to a session
-so far — a floor on a minority of usage, not a total. No dollar figure or controlled A/B yet;
+so far — an upper bound for that minority of usage, not a total. No dollar figure or controlled A/B yet;
 see SAVINGS.md's Limits section.
 
 ## Accuracy eval
