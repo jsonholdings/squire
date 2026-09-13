@@ -31,8 +31,10 @@ Two independently-labelled layers, computed by [`scripts/squire_report.py`](../s
    and then multiplying by how many turns remained in that call's own session at or
    after it ran gives an estimate of the cache-read cost avoided — because that avoided
    text would otherwise have sat in context, re-billed, for every one of those turns.
-   This is an upper-bound proxy, not a certainty: it assumes the avoided text would
-   otherwise have stayed in context verbatim for all remaining turns.
+   **Per call, this is an upper bound**: it assumes the avoided text would otherwise
+   have stayed in context verbatim for every remaining turn, with no compaction. **Across
+   all usage, it is incomplete**: it covers only the calls that could be tied to a session
+   (see below), so it says nothing about the rest.
 
 ## The numbers
 
@@ -70,8 +72,8 @@ these calls did not.
 
 Of the 125 logged calls, only **48 (38%)** could be correlated to a specific session
 (the rest predate session-correlation in the ledger, or ran outside a session). The
-cache-read-avoided estimate above is computed only from those 48 — it is a **floor on
-a minority of squire's real usage**, not a total.
+cache-read-avoided estimate above is computed only from those 48. It is an upper-bound
+estimate for **a minority of squire's real usage**, not a total for all of it.
 
 ## Dollar cost
 

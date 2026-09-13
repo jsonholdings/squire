@@ -4,3 +4,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# scrub_check.py's site-specific denylist must never live inside this repo -- it names
+# internal hosts and venture names (feedback_never_publish_infrastructure_shape.md).
+# Defensive only: the real copy lives at ~/.config/squire/scrub-denylist.txt, outside
+# any repo, but this blocks an accidental local copy from being added here too.
+scrub-denylist.txt
+.scrub-denylist*
+
