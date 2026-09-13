@@ -1,5 +1,11 @@
 # Measuring real savings
 
+**See [`SAVINGS.md`](SAVINGS.md) for the current write-up with real numbers.** This page is
+the method/tooling reference; the session-to-ledger correlation described below as a gap was
+implemented 2026-09-12 (`squire_report.py`'s `cache_read_avoided_ESTIMATE`) — SAVINGS.md has
+the up-to-date figures, this page's own "what was actually measured" section below predates
+that and is kept only for its narrower single-project reproduction example.
+
 squire's value claim is a token-savings claim, so it is measured, not asserted. Two numbers, kept
 separate on purpose:
 

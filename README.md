@@ -126,26 +126,17 @@ See [`docs/claude-code.md`](docs/claude-code.md).
 
 [`scripts/squire_report.py`](scripts/squire_report.py) reads Claude Code's own session JSONL files
 (`~/.claude/projects/*/*.jsonl`) and squire's local ledger (`~/.squire/ledger.jsonl`), and reports
-two clearly separated numbers: **VERIFIED** (real `usage` blocks Claude Code itself recorded) and
-**ESTIMATE** (a labelled heuristic on the ledger's char counts). Full method, caveats and how to
-run it on your own transcripts: [`docs/measuring-savings.md`](docs/measuring-savings.md).
+two clearly separated numbers: **MEASURED** (real `usage` blocks Claude Code itself recorded) and
+**ESTIMATED** (a labelled heuristic on the ledger's char counts, now correlated to each call's own
+session). Full write-up with current numbers, method and honest limits:
+[`docs/SAVINGS.md`](docs/SAVINGS.md) (method background: [`docs/measuring-savings.md`](docs/measuring-savings.md)).
 
-**Real numbers measured on this machine, 2026-09-12** (VERIFIED, one project's 34 sessions):
-
-| Metric | Value | Source |
-|---|---|---|
-| Turns | 70,030 | `usage` blocks, summed |
-| Cache-read tokens | 21,713,327,662 | `usage` blocks, summed |
-| Cache-creation tokens | 315,121,245 | `usage` blocks, summed |
-| Input tokens (uncached) | 784,617 | `usage` blocks, summed |
-| Output tokens | 77,985,694 | `usage` blocks, summed |
-
-squire's own ledger on the same machine (23 calls logged so far) shows 10,893 chars in vs. 1,552
-chars out, an ESTIMATED one-time saving of ~2,335 tokens (chars/4 heuristic) — small so far because
-the ledger is new; it grows with use. **The multiplier from one-time chars-saved to actual
-cache-read tokens avoided across a session's remaining turns is not yet computed** — the ledger
-does not currently record which session a call belonged to, so that correlation is reported as
-`UNKNOWN` rather than guessed. See `docs/measuring-savings.md` for what closing that gap requires.
+**Headline, 2026-09-12** (186 real sessions, aggregated — see SAVINGS.md for the full table):
+cache-read tokens outnumber uncached input by roughly 27,500:1 (MEASURED), and squire's own ledger
+shows 96% of the characters sent to it were kept out of context entirely (MEASURED chars saved),
+with an ESTIMATED 18.7M cache-read tokens avoided across the 38% of calls correlated to a session
+so far — a floor on a minority of usage, not a total. No dollar figure or controlled A/B yet;
+see SAVINGS.md's Limits section.
 
 ## Accuracy eval
 
