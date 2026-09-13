@@ -3,7 +3,21 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Branding: hand-written SVG logo/wordmark (light + dark, `docs/assets/`), icon-only mark,
+  1280x640 social-preview source + rendered PNG, tagline "Offload the bulk, keep the context."
+  README gets a logo header, license/python/tests badges, a table of contents, and a
+  MEASURED/ESTIMATED callout convention; footer credits "A JSON Holdings project".
+- README "Install" section rewritten as tested, numbered command blocks (prerequisites,
+  git-install, clone+editable install, Docker build, MCP registration, hook install, `squire
+  doctor` verify), each block's real exit code noted, PyPI/zipapp explicitly marked not yet
+  available.
+
 ### Security
+- `scrub_check.py`'s email-address pattern no longer misreads a `git@host:path` SSH clone
+  URL as a leaked email address (the domain's greedy TLD match backtracked around a naive
+  `(?!:)` lookahead) -- fixed with a word boundary before the lookahead. Control-proofed:
+  a real email address followed by punctuation still fires.
 - `scrub_check.py`'s secret-shaped pattern now catches an unquoted `key: value` /
   `key = value` credential line, not only a quoted literal, and now scans its own
   source file (an earlier version excluded `scrub_check.py` by name, which is how a

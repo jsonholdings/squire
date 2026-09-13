@@ -32,7 +32,7 @@ SKIP_DIRS = {"eval/fixtures"}
 
 GENERIC_PATTERNS = {
     "home path": r"/home/[a-z][a-z0-9_-]*",
-    "email address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "email address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?!:)",  # \b(?!:) excludes git@host:path SSH URLs
     "private IPv4": r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
                      r"|192\.168\.\d{1,3}\.\d{1,3}"
                      r"|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",

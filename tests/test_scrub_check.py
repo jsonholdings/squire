@@ -152,6 +152,33 @@ def test_a_fake_secret_built_by_concatenation_is_not_visible_as_static_text():
     assert fake_secret not in text
 
 
+def test_git_ssh_clone_url_is_not_an_email_finding():
+    """Regression: an SSH git URL (user@host:path) has the exact shape of an email
+    address up to the colon, and README.md legitimately shows one as a clone
+    command. Control below proves a real email in the same shape (but followed by
+    punctuation, not a colon) still fires."""
+    target = os.path.join(ROOT, "CTRL_SSH_URL.md")
+    with open(target, "w") as fh:
+        fh.write("git clone git@github.com:jsonholdings/squire.git\n")
+    try:
+        code, out = _run(env={"SQUIRE_SCRUB_DENYLIST": "/nonexistent/does-not-exist.txt"})
+        assert code == 0, out
+    finally:
+        os.remove(target)
+
+
+def test_a_real_email_address_is_still_caught_control():
+    target = os.path.join(ROOT, "CTRL_EMAIL.md")
+    with open(target, "w") as fh:
+        fh.write("Contact us at " + "hello" + "@" + "example.com" + ", any time.\n")
+    try:
+        code, out = _run(env={"SQUIRE_SCRUB_DENYLIST": "/nonexistent/does-not-exist.txt"})
+        assert code == 1, out
+        assert "email address" in out
+    finally:
+        os.remove(target)
+
+
 def test_a_denylist_file_copied_into_the_repo_is_itself_a_finding():
     """The sync-from-source safety net: even a file merely NAMED like the denylist,
     sitting inside this repo's tree, must fail the check on its own -- independent of

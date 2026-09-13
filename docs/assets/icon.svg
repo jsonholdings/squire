@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="squire icon">
+  <title>squire</title>
+  <!-- flat shield outline: hairline stroke only, no fill/gradient -->
+  <path d="M32 4 L56 13 V30 C56 46 46 56 32 60 C18 56 8 46 8 30 V13 Z"
+        fill="none" stroke="#806536" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- carried pack: a small offset flat square, evoking gear carried on the shoulder -->
+  <rect x="24" y="27" width="16" height="16" fill="#14161a"/>
+  <rect x="28" y="23" width="8" height="6" fill="#14161a"/>
+</svg>

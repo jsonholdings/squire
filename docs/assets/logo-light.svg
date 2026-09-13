@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 64" width="340" height="64" role="img" aria-label="squire logo">
+  <title>squire</title>
+  <g transform="translate(2,2)">
+    <path d="M30 0 L54 9 V26 C54 42 44 52 30 56 C16 52 6 42 6 26 V9 Z"
+          fill="none" stroke="#806536" stroke-width="2.5" stroke-linejoin="round"/>
+    <rect x="22" y="23" width="16" height="16" fill="#14161a"/>
+    <rect x="26" y="19" width="8" height="6" fill="#14161a"/>
+  </g>
+  <text x="76" y="42" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+        font-size="30" font-weight="600" letter-spacing="0.5" fill="#14161a">squire</text>
+</svg>

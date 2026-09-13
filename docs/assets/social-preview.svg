@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <title>squire — offload the bulk, keep the context</title>
+  <rect x="0" y="0" width="1280" height="640" fill="#fbfaf7"/>
+  <rect x="0" y="0" width="1280" height="640" fill="none" stroke="#e3ded4" stroke-width="4"/>
+
+  <g transform="translate(120,180)">
+    <path d="M90 0 L162 27 V78 C162 126 132 156 90 168 C48 156 18 126 18 78 V27 Z"
+          fill="none" stroke="#806536" stroke-width="6" stroke-linejoin="round"/>
+    <rect x="66" y="69" width="48" height="48" fill="#14161a"/>
+    <rect x="78" y="57" width="24" height="18" fill="#14161a"/>
+  </g>
+
+  <text x="340" y="300" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+        font-size="96" font-weight="600" letter-spacing="1" fill="#14161a">squire</text>
+
+  <text x="342" y="360" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="30" fill="#4a4f57">Offload the bulk, keep the context.</text>
+
+  <line x1="342" y1="400" x2="900" y2="400" stroke="#e3ded4" stroke-width="2"/>
+
+  <text x="342" y="440" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+        font-size="20" letter-spacing="2" fill="#676d75">A JSON HOLDINGS PROJECT</text>
+</svg>

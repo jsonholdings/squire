@@ -1,4 +1,28 @@
-# squire
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.svg">
+  <img alt="squire" src="docs/assets/logo-light.svg" width="272" height="51">
+</picture>
+
+Offload the bulk, keep the context.
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-806536)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-806536)](pyproject.toml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/jsonholdings/squire/ci.yml?branch=main&label=tests)](.github/workflows/ci.yml)
+
+## Table of contents
+
+- [Why](#why)
+- [Guarantees](#guarantees)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Commands](#commands)
+- [Backends](#backends)
+- [Claude Code integration](#claude-code-integration)
+- [Measuring savings](#measuring-savings)
+- [Accuracy eval](#accuracy-eval)
+- [License](#license)
+- [Contributing / Security](#contributing--security)
 
 **squire** is a small local sidekick for [Claude Code](https://claude.com/claude-code) (or any
 CLI-agent workflow). Claude sessions pay per token they read, and every large tool result, log or
@@ -10,12 +34,17 @@ It is deliberately boring: real exit codes are never hidden, model output is nev
 fact, and a down backend fails loud (`UNKNOWN`) instead of silently passing raw text through as if
 it had been checked.
 
-**Status: v0.2.0, pre-release.** Every command in `squire --help` is implemented: `run`, `sum`,
+**Status: v0.2.3, pre-release.** Every command in `squire --help` is implemented: `run`, `sum`,
 `ask`, `draft`, `diff`, `grep`, `triage`, `stats`, `doctor`, `--json`, `--version`. Pluggable
 backends (`SQUIRE_BACKEND=ollama|openai`), `SQUIRE_MODEL=auto`, `SQUIRE_ALLOW_HOSTS`, and secret
 redaction are also implemented (`squire.py`, verified via `squire --help` and `redact()`). Docker
 compose, an MCP server, hooks, and a live accuracy eval are built — see the table below and
 `docker/`, `mcp/`, `hooks/`, `eval/`.
+
+> **MEASURED** vs **ESTIMATED**, used throughout this README and `docs/`: a MEASURED number comes
+> straight from a real recorded count (Claude Code's own `usage` blocks, squire's own ledger byte
+> counts). An ESTIMATED number is derived from a MEASURED one via a stated, labelled method (a
+> chars-per-token heuristic, a turn-multiplier) and is never presented as a certainty.
 
 ## Why
 
@@ -42,29 +71,71 @@ available to shrink that number.
 
 ## Install
 
-Packaging (wheel + zipapp) is built and VERIFIED; PyPI publication itself is pending owner
-approval to publish (outward-facing, see `CLAUDE.md`).
+This repository is currently **private**. The `https://` clone below needs GitHub auth (a
+personal access token, or `gh auth login`) until the owner makes it public; the `git@` SSH form
+needs your SSH key on the account either way.
 
-**From source:**
+Every block below was run for real against this checkout (or a local-clone equivalent where the
+GitHub URL itself isn't reachable yet) — see the exit code noted under each.
+
+**1. Prerequisite: Ollama, with the default model pulled**
 ```sh
-git clone <repo-url> squire && cd squire
-python3 squire.py --help
-ln -s "$(pwd)/squire.py" ~/bin/squire   # optional: put it on PATH
+ollama pull qwen2.5:14b
 ```
+squire talks to Ollama at `127.0.0.1:11434` by default (`SQUIRE_OLLAMA` to override) and refuses
+any non-localhost backend unless it's in `SQUIRE_ALLOW_HOSTS`. Tested: exit 0 (model already
+present on the test machine; a first pull is ~9GB).
 
-**pipx (once published to PyPI):**
+**2. Install straight from git**
 ```sh
-pipx install squire-cli
+pip install "squire-offload @ git+https://github.com/jsonholdings/squire.git"
 ```
+Tested via the local-checkout equivalent (`pip install <path>` in a clean venv) — exit 0,
+`squire --help` exit 0. Not yet tested against the real GitHub URL (repo not pushed there yet).
 
-**Single-file zipapp:** built via `pyproject.toml`'s packaging — `python3 squire.pyz --help`, no
-install step. Attached to each tagged GitHub release once one exists.
+**3. Clone + editable local install**
+```sh
+git clone git@github.com:jsonholdings/squire.git
+cd squire && pip install -e .
+```
+Tested against a local clone of this checkout — clone exit 0, `pip install -e .` exit 0.
 
-**Docker:** `cd docker && docker compose up` (GPU) or add `-f docker-compose.cpu.yml` for CPU-only.
-Brings up Ollama healthchecked on `127.0.0.1:11434`, a one-shot model-pull job, and runs `squire`
-as a one-off container (`docker compose run --rm squire ...`). VERIFIED: `docker compose config`
-validates and a live Ollama health check passed on an alternate port during testing. See
-[`docs/backends.md`](docs/backends.md) and `docker/README.md`.
+**4. Docker**
+```sh
+docker build -t squire -f docker/Dockerfile .
+```
+Tested: exit 0 (image builds, `docker run squire --help` exit 0). For the full stack (Ollama +
+squire), `docker compose -f docker-compose.yml up` (GPU) or add `-f docker-compose.cpu.yml` for
+CPU-only — the compose files themselves validate (`docker compose ... config`, exit 0); a full
+`up` wasn't run live here to avoid an unattended multi-GB pull. See `docker/README.md`.
+
+**5. Register with Claude Code (MCP)**
+```sh
+claude mcp add squire -- python3 mcp/squire_mcp.py
+```
+Not live-registered in this environment; verified instead that `mcp/squire_mcp.py` completes a
+real MCP `initialize` handshake (protocol 2025-06-18) over stdio, exit 0. Confirm registration
+yourself with `claude mcp list`.
+
+**6. Or wire the PreToolUse hook directly**
+```sh
+python3 integrations/install_claude_code.py --settings ~/.claude/settings.json
+```
+`--check` (dry run) against a fresh settings file correctly reports `hook: MISSING`, `mcp:
+MISSING`, exit 1 — that's the expected result for an unconfigured target; running without
+`--check` installs both. See [`integrations/CLAUDE-snippet.md`](integrations/CLAUDE-snippet.md)
+to add the equivalent by hand instead.
+
+**7. Verify the install**
+```sh
+squire doctor
+```
+Tested: exit 0, `[squire] READY`, backend and model both confirmed reachable. `squire doctor
+--json` also exit 0 with `"ready": true` for scripting.
+
+**Not yet available:** PyPI publication (`pipx install squire-offload` once published — pending
+owner approval, outward-facing) and a zipapp attached to a tagged release (no release exists
+yet). Don't follow either until this section is updated to say they're live.
 
 ## Quickstart
 
@@ -152,3 +223,7 @@ Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 ## Contributing / Security
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
+
+---
+
+<sub>A JSON Holdings project.</sub>
