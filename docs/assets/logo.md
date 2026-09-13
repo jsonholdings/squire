@@ -1,10 +1,11 @@
 # Logo assets
 
 `logo-source.svg` is the ONLY hand-maintained file here. Everything else in this
-directory — `icon.svg`, `logo-light.svg`, `logo-dark.svg`, `social-preview.svg` and
-`social-preview.png` — is generated from it by `scripts/build_logo_assets.py` and must
-never be hand-edited; the CI-enforced staleness check (`tests/test_logo_assets.py`)
-fails the build if an output no longer matches the source.
+directory — `icon.svg`, `logo-light.svg`, `logo-dark.svg`, `social-preview.svg`,
+`social-preview.png`, `avatar.svg` and `avatar.png` — is generated from it by
+`scripts/build_logo_assets.py` and must never be hand-edited; the CI-enforced staleness
+check (`tests/test_logo_assets.py`) fails the build if an output no longer matches the
+source.
 
 ## To change the logo, replace ONE file
 
@@ -27,6 +28,20 @@ jsonholdings.com's Open Source card embeds directly (inline, not an external fil
 request, per that site's own no-CDN rule). Re-run it and re-paste after any
 `logo-source.svg` change; it is not synced automatically since it lives in a different
 repo (`business/jsonholdings/site`).
+
+## Avatar
+
+`avatar.png` is a 500x500 square: the icon mark centred with ~15% padding on a solid
+paper background (`#fbfaf7`, Squire's own palette from `social-preview.svg`), built the
+same way as `build_avatar.py` in the JSON Holdings org's `.github` mirror repo. Swap it
+the same way as everything else here: replace `logo-source.svg`, then run
+`python3 scripts/build_logo_assets.py`.
+
+It is for the GitHub org profile picture or wherever else a square Squire mark is
+needed — a repository has no avatar of its own; what shows on a repo's card is the
+social preview image built above (`social-preview.png`). Uploading a chosen avatar is
+always a manual UI step (GitHub org Settings -> Profile picture, or wherever it is
+used) — this script only produces the file, never uploads it.
 
 ## README embed
 

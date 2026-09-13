@@ -10,7 +10,8 @@ Swap the logo by replacing ONE file:
        plus two solid rects, viewBox "0 0 64 64", light-mode colours baked in).
     2. Run `python3 scripts/build_logo_assets.py`.
     3. Everything downstream regenerates from that one shape: the icon, both wordmark
-       variants, the social-preview image, and the snippet used on jsonholdings.com.
+       variants, the social-preview image, the 500x500 avatar, and the snippet used on
+       jsonholdings.com.
     See docs/assets/logo.md for the exact regenerate command and what it touches.
 
 The dark variant is not re-derived from CSS or `prefers-color-scheme` at build time --
@@ -42,9 +43,18 @@ LOGO_LIGHT = os.path.join(ASSETS, "logo-light.svg")
 LOGO_DARK = os.path.join(ASSETS, "logo-dark.svg")
 SOCIAL_SVG = os.path.join(ASSETS, "social-preview.svg")
 SOCIAL_PNG = os.path.join(ASSETS, "social-preview.png")
-OUTPUTS = [ICON, LOGO_LIGHT, LOGO_DARK, SOCIAL_SVG, SOCIAL_PNG]
+AVATAR_SVG = os.path.join(ASSETS, "avatar.svg")
+AVATAR_PNG = os.path.join(ASSETS, "avatar.png")
+OUTPUTS = [ICON, LOGO_LIGHT, LOGO_DARK, SOCIAL_SVG, SOCIAL_PNG, AVATAR_SVG, AVATAR_PNG]
 
 TAGLINE = "Offload the bulk, keep the context."
+
+# Same 500x500 minimum and padding fraction as the org avatar (build_avatar.py in the
+# .github mirror repo) so both avatars in the portfolio follow one convention.
+AVATAR_SIZE = 500
+AVATAR_PAD_FRACTION = 0.15
+# The paper background from social-preview.svg -- Squire's own palette, not a new colour.
+AVATAR_BG = "#fbfaf7"
 
 # Light-mode hex (as they appear in logo-source.svg) -> the documented dark-mode
 # equivalent. Kept as an explicit table, not computed, so a colour change is a
@@ -133,6 +143,32 @@ def build_social_preview(source_text):
         raise SystemExit("rsvg-convert failed on social-preview.svg: %s" % proc.stderr.strip())
 
 
+def build_avatar(source_text):
+    """500x500 square avatar: the icon mark centred on a solid paper background with
+    ~15% padding on each side, same convention as build_avatar.py in the .github mirror
+    repo (GitHub org avatar). For the GitHub org profile picture or elsewhere a square
+    mark is needed -- a repo itself has no avatar; what shows on the repo card is the
+    social preview image built above."""
+    shapes = _shape_elements(source_text)  # light colours, as authored
+    pad = round(AVATAR_SIZE * AVATAR_PAD_FRACTION)
+    inner = AVATAR_SIZE - 2 * pad
+    scale = inner / 64.0
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {AVATAR_SIZE} {AVATAR_SIZE}" width="{AVATAR_SIZE}" height="{AVATAR_SIZE}">
+  <title>squire avatar</title>
+  <rect width="{AVATAR_SIZE}" height="{AVATAR_SIZE}" fill="{AVATAR_BG}"/>
+  <g transform="translate({pad},{pad}) scale({scale})">
+    {shapes}
+  </g>
+</svg>
+'''
+    open(AVATAR_SVG, "w", encoding="utf-8").write(svg)
+    proc = subprocess.run(["rsvg-convert", "-w", str(AVATAR_SIZE), "-h", str(AVATAR_SIZE),
+                           "-o", AVATAR_PNG, AVATAR_SVG],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise SystemExit("rsvg-convert failed on avatar.svg: %s" % proc.stderr.strip())
+
+
 def site_snippet(source_text):
     """The inline SVG jsonholdings.com's Open Source card embeds directly (no external
     file request, per that site's own CLAUDE.md: no CDNs, everything served locally --
@@ -151,6 +187,7 @@ def build():
     build_icon(source_text)
     build_wordmarks(source_text)
     build_social_preview(source_text)
+    build_avatar(source_text)
     manifest = {"source_sha256": _hash(SOURCE), "outputs": [os.path.basename(p) for p in OUTPUTS]}
     json.dump(manifest, open(MANIFEST, "w"), indent=2)
     print("wrote %s" % ", ".join(os.path.relpath(p, HERE) for p in OUTPUTS))

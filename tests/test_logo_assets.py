@@ -40,3 +40,25 @@ def test_the_staleness_check_can_actually_fire_control():
         # so this test never leaves the repo in a state the FIRST test would fail on.
         mod.build()
         assert mod._hash(mod.SOURCE) == real_hash, "source should not have changed"
+
+
+def test_avatar_is_500x500_and_in_the_staleness_gate():
+    mod = _load()
+    assert mod.AVATAR_PNG in mod.OUTPUTS
+    assert os.path.isfile(mod.AVATAR_PNG)
+    import subprocess
+    out = subprocess.run(["file", mod.AVATAR_PNG], stdout=subprocess.PIPE, text=True).stdout
+    assert "500 x 500" in out, out
+
+
+def test_missing_avatar_makes_check_fail_control():
+    """Control: a missing/stale avatar.png must fail --check, not pass silently."""
+    mod = _load()
+    real_hash = mod._hash(mod.SOURCE)
+    try:
+        os.remove(mod.AVATAR_PNG)
+        assert mod.check() == 1
+    finally:
+        mod.build()
+        assert mod._hash(mod.SOURCE) == real_hash, "source should not have changed"
+        assert os.path.isfile(mod.AVATAR_PNG)
