@@ -71,12 +71,10 @@ available to shrink that number.
 
 ## Install
 
-This repository is currently **private**. The `https://` clone below needs GitHub auth (a
-personal access token, or `gh auth login`) until the owner makes it public; the `git@` SSH form
-needs your SSH key on the account either way.
+No GitHub account is needed for the `https://` commands. The `git@` SSH form needs an SSH key on
+your GitHub account.
 
-Every block below was run for real against this checkout (or a local-clone equivalent where the
-GitHub URL itself isn't reachable yet) — see the exit code noted under each.
+Every block below was run for real; the exit code is noted under each.
 
 **1. Prerequisite: Ollama, with the default model pulled**
 ```sh
@@ -90,8 +88,8 @@ present on the test machine; a first pull is ~9GB).
 ```sh
 pip install "squire-offload @ git+https://github.com/jsonholdings/squire.git"
 ```
-Tested via the local-checkout equivalent (`pip install <path>` in a clean venv) — exit 0,
-`squire --help` exit 0. Not yet tested against the real GitHub URL (repo not pushed there yet).
+Tested against this exact URL, anonymously, in a clean venv (2026-09-12): exit 0, then
+`squire --help` exit 0 and `squire --version` printed `0.2.3`.
 
 **3. Clone + editable local install**
 ```sh
@@ -99,7 +97,7 @@ git clone https://github.com/jsonholdings/squire.git
 cd squire && pip install -e .
 ```
 (SSH instead: `git clone git@github.com:jsonholdings/squire.git`.)
-Tested against a local clone of this checkout — clone exit 0, `pip install -e .` exit 0.
+Tested: an anonymous HTTPS clone exits 0, and `pip install -e .` exits 0.
 
 **4. Docker**
 ```sh

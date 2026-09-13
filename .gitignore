@@ -12,3 +12,6 @@ dist/
 scrub-denylist.txt
 .scrub-denylist*
 
+# session-claim's lock file carries local paths; it's generated, never committed.
+SESSION-CLAIM.md
+
