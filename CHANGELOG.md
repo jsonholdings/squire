@@ -7,20 +7,22 @@ versions follow [SemVer](https://semver.org/).
 - `squire run -- <cmd>`: real exit code, raw tail and a local failure summary. Output of 60 lines
   or fewer passes through with no model.
 - `squire sum`, `squire ask`, `squire draft`: condense, answer and draft using a local Ollama model.
+- `squire diff [--staged] | <ref1> <ref2>`: condense a large git diff, always shows the real
+  `git diff --stat` line regardless of backend health.
+- `squire stats`: reads a local ledger (`~/.squire/ledger.jsonl`, chmod 700) of chars in/out per
+  call; reports real character counts plus a clearly-labelled ESTIMATED token figure (chars/4
+  heuristic) that must be cross-checked against real session usage blocks before being cited.
+- `--json` flag on every command: emits `{cmd, exit_code, raw_tail, summary, assumed, backend_ok,
+  verify_flag}` for machine consumption (a future hook or MCP wrapper).
+- Self-check pass (`condense_verified`) on `run` and `diff` summaries: a second local model call
+  checks the summary against the source for invented or omitted failures, and appends a visible
+  `verify flag` line if it disagrees. Never blocks or retries silently; itself ASSUMED and can be
+  wrong. Not applied to `sum`/`ask`/`draft` (would double their cost for lower-stakes text).
 - Safety guarantees: backend down → `UNKNOWN`, model output labelled ASSUMED, `num_ctx` set
   explicitly, large inputs chunked.
 - Project scaffolding: tests, CI, scrub check, CONTRIBUTING, SECURITY, pyproject.
-- Extracted to a standalone repo skeleton: README install/safety/benchmark-TBD sections,
-  LICENSE-PENDING.md placeholder (MIT vs Apache-2.0 undecided).
 
-### Not done (future work, out of scope for this extraction)
-- CLI expansion: `grep` (semantic search), `diff` (summarize a git diff), `triage`, `--json`
-  output for agents.
-- Backend abstraction beyond Ollama (llama.cpp server, vLLM, OpenAI-compatible endpoints);
-  model auto-pick by VRAM; auto `num_ctx`.
-- Docker Compose stack (`squire-stack`, GPU/CPU Ollama, API, health endpoint).
-- Claude Code integration: MCP server, PostToolUse hook example, CLAUDE.md snippet, subagent
-  definition.
-- Metrics/ledger and `squire stats`.
-- Eval set with a recall target for failures, beyond the four safety-control unit tests.
-- Publishing: no LICENSE chosen, no GitHub remote added, no push — owner sign-off required.
+### Not done
+- `squire grep` (semantic search), `squire triage`, PostToolUse hook, Docker stack, MCP server,
+  backend abstraction beyond Ollama — see `SPEC-LOCAL-OFFLOAD-TOOLING.md` and
+  `SPEC-OPEN-SOURCE.md`.

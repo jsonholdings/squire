@@ -10,6 +10,11 @@ session reads it.
     squire sum [file|-]          condense text to a few bullets
     squire ask "question" [file|-]   answer a question from the given text only
     squire draft "instructions" [file|-]  first draft for Claude to review
+    squire diff [--staged] | squire diff <ref1> <ref2>   condense a large git diff
+    squire stats                 real chars in/out logged, plus a labelled token estimate
+
+Any command accepts a trailing --json to emit one JSON object instead of formatted text:
+    {"cmd", "exit_code", "raw_tail", "summary", "assumed", "backend_ok"}
 
 Rules built in (global CLAUDE.md section 5.8):
 - Exit codes and the raw tail are ALWAYS printed. The model never decides pass or fail.
@@ -72,6 +77,26 @@ def condense(text, task, max_tokens=300):
     return llm(f"{task}\nCombine these partial notes into one answer:\n\n" + "\n".join(notes), max_tokens)
 
 
+def condense_verified(text, task, max_tokens=300):
+    """Like condense(), plus a second local pass checking the summary against the source.
+    Used only where an inaccurate summary would mislead a real decision (test failures, diffs) --
+    not for every squire call, since it doubles the model cost. Never blocks or retries silently:
+    a flagged issue is appended to the output, visible, never hidden. The verify pass is itself
+    ASSUMED and can be wrong; it is a quality signal, not a correctness guarantee."""
+    summary = condense(text, task, max_tokens)
+    if summary.startswith("UNKNOWN"):
+        return summary, None
+    check = llm(
+        "SOURCE (truncated) and a SUMMARY of it follow. Reply with exactly 'OK' if the summary "
+        "invents nothing not supported by the source and omits no failure/error the source contains. "
+        "Otherwise reply with one short sentence naming the specific inaccuracy.\n\n"
+        f"SOURCE:\n{text[:CHUNK]}\n\nSUMMARY:\n{summary}", 60)
+    if check.startswith("UNKNOWN"):
+        return summary, None
+    flag = None if check.strip().rstrip(".").upper() == "OK" else check.strip()
+    return summary, flag
+
+
 def read_input(arg):
     if arg in (None, "-"):
         return sys.stdin.read()
@@ -79,28 +104,75 @@ def read_input(arg):
         return f.read()
 
 
+def emit(cmd, exit_code, raw_tail, summary, backend_ok, json_mode, verify_flag=None):
+    # Single point of output for every command so --json and human text can never drift apart --
+    # both come from the same fields, with exit_code/raw_tail always present in both.
+    assumed = summary is not None
+    if json_mode:
+        print(json.dumps({"cmd": cmd, "exit_code": exit_code, "raw_tail": raw_tail,
+                          "summary": summary, "assumed": assumed, "backend_ok": backend_ok,
+                          "verify_flag": verify_flag}))
+        return
+    if raw_tail is not None:
+        print(raw_tail, end="" if raw_tail.endswith("\n") else "\n")
+    if summary is not None:
+        print(f"[squire] --- local summary (ASSUMED{'' if backend_ok else '; backend UNKNOWN'}) ---")
+        print(summary)
+        if verify_flag:
+            print(f"[squire] --- verify flag (ASSUMED, may itself be wrong): {verify_flag} ---")
+
+
 def cmd_run(argv):
+    json_mode = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if not argv:
-        sys.exit("usage: squire run -- <command...>")
+        sys.exit("usage: squire run -- <command...> [--json]")
     p = subprocess.run(argv if len(argv) > 1 else argv[0], shell=len(argv) == 1,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     out = p.stdout or ""
     lines = out.splitlines()
-    print(f"[squire] exit={p.returncode} lines={len(lines)}")
+    if not json_mode:
+        print(f"[squire] exit={p.returncode} lines={len(lines)}")
     if len(lines) <= SHORT:
-        print(out, end="")
+        emit("run", p.returncode, out, None, True, json_mode)
     else:
-        print(f"[squire] --- raw tail ({TAIL} lines) ---")
-        print("\n".join(lines[-TAIL:]))
-        print("[squire] --- local summary (ASSUMED; the exit code above is authoritative) ---")
-        summary = condense(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
+        tail = "\n".join(lines[-TAIL:])
+        if not json_mode:
+            print(f"[squire] --- raw tail ({TAIL} lines) ---")
+        summary, flag = condense_verified(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
                             "List every failing test/error with file:line and the one-line cause. "
                             "Say 'no errors seen' only if there are none. Never invent names.")
-        print(summary)
-        log_call("run", len(out), len(summary), not summary.startswith("UNKNOWN"))
+        ok = not summary.startswith("UNKNOWN")
+        log_call("run", len(out), len(summary), ok)
+        emit("run", p.returncode, tail, summary, ok, json_mode, flag)
     sys.exit(p.returncode)
+
+
+def cmd_diff(argv):
+    json_mode = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
+    if argv and argv[0] == "--staged":
+        gitcmd = ["git", "diff", "--staged"]
+    elif len(argv) >= 2:
+        gitcmd = ["git", "diff", argv[0], argv[1]]
+    else:
+        gitcmd = ["git", "diff"]
+    p = subprocess.run(gitcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    diff_text = p.stdout or ""
+    stat = subprocess.run(gitcmd + ["--stat"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace").stdout.strip()
+    if not diff_text.strip():
+        emit("diff", p.returncode, "(no diff)", None, True, json_mode)
+        return
+    summary, flag = condense_verified(diff_text, "Summarize this git diff by file/module. Separate logic changes "
+                       "from formatting/rename-only changes. Be factual, keep exact file paths and names.")
+    ok = not summary.startswith("UNKNOWN")
+    log_call("diff", len(diff_text), len(summary), ok)
+    if not json_mode:
+        print(f"[squire] {stat.splitlines()[-1] if stat else '(no stat)'}")
+    emit("diff", p.returncode, stat, summary, ok, json_mode, flag)
 
 
 def cmd_stats(argv):
@@ -125,27 +197,43 @@ def main():
         print(__doc__)
         return
     cmd, rest = sys.argv[1], sys.argv[2:]
+    json_mode = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
     if cmd == "run":
-        cmd_run(rest)
+        cmd_run(sys.argv[2:])  # cmd_run does its own --json scan; the command being run may itself use flags
+    elif cmd == "diff":
+        cmd_diff(sys.argv[2:])
     elif cmd == "sum":
         text = read_input(rest[0] if rest else None)
         out = condense(text, "Condense to at most 8 factual bullets. Keep numbers, names, paths exact.")
-        print("[squire] " + out)
-        log_call("sum", len(text), len(out), not out.startswith("UNKNOWN"))
+        ok = not out.startswith("UNKNOWN")
+        log_call("sum", len(text), len(out), ok)
+        if json_mode:
+            print(json.dumps({"cmd": "sum", "exit_code": None, "raw_tail": None, "summary": out, "assumed": True, "backend_ok": ok}))
+        else:
+            print("[squire] " + out)
     elif cmd == "ask":
         if not rest:
-            sys.exit('usage: squire ask "question" [file|-]')
+            sys.exit('usage: squire ask "question" [file|-] [--json]')
         text = read_input(rest[1] if len(rest) > 1 else None)
         out = condense(text, f"Answer using ONLY this text; say UNKNOWN if it is not there. Question: {rest[0]}")
-        print("[squire] " + out)
-        log_call("ask", len(text), len(out), not out.startswith("UNKNOWN"))
+        ok = not out.startswith("UNKNOWN")
+        log_call("ask", len(text), len(out), ok)
+        if json_mode:
+            print(json.dumps({"cmd": "ask", "exit_code": None, "raw_tail": None, "summary": out, "assumed": True, "backend_ok": ok}))
+        else:
+            print("[squire] " + out)
     elif cmd == "draft":
         if not rest:
-            sys.exit('usage: squire draft "instructions" [file|-]')
+            sys.exit('usage: squire draft "instructions" [file|-] [--json]')
         src = read_input(rest[1]) if len(rest) > 1 else ""
         out = llm(f"{rest[0]}\n\nSource material (may be empty):\n{src[:CHUNK]}", 1200)
-        print(out)
-        log_call("draft", len(src), len(out), not out.startswith("UNKNOWN"))
+        ok = not out.startswith("UNKNOWN")
+        log_call("draft", len(src), len(out), ok)
+        if json_mode:
+            print(json.dumps({"cmd": "draft", "exit_code": None, "raw_tail": None, "summary": out, "assumed": True, "backend_ok": ok}))
+        else:
+            print(out)
     elif cmd == "stats":
         cmd_stats(rest)
     else:
