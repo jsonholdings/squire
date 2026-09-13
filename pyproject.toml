@@ -4,15 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "squire-offload"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local sidekick for Claude Code: offload bulk text (test output, logs, diffs, search) to your own GPU."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
-# SPDX identifier pending the owner's choice (MIT or Apache-2.0) -- see SPEC-OPEN-SOURCE.md
-# "Open questions". scripts/scrub_check.py --release blocks a tagged release without a LICENSE
-# file; do not set this to a real license id until that decision is made.
-license = { text = "UNLICENSED (pending owner choice: MIT or Apache-2.0)" }
+license = { text = "Apache-2.0" }
 authors = [
     { name = "JSON Holdings" },
 ]

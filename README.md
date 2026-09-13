@@ -156,8 +156,7 @@ unreachable — see `eval/run_eval.py` docstring.
 
 ## License
 
-Pending the maintainer's choice (MIT or Apache-2.0). Not yet published; `scripts/scrub_check.py
---release` blocks a tagged release until `LICENSE` exists.
+Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 ## Contributing / Security
 

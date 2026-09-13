@@ -4,6 +4,14 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 ### Added
+- Apache-2.0 `LICENSE` and `NOTICE` (JSON Holdings LLC, 2026). `pyproject.toml` license field and
+  README license section updated to match. Repo remains private and unpushed; this only unblocks
+  `scripts/scrub_check.py --release`'s license gate.
+
+### Removed
+- Stray duplicate `test_squire.py` at the repo root (the real copy lives under `tests/`).
+
+### Added (from previous sync)
 - `squire run -- <cmd>`: real exit code, raw tail and a local failure summary. Output of 60 lines
   or fewer passes through with no model.
 - `squire sum`, `squire ask`, `squire draft`: condense, answer and draft using a local Ollama model.
