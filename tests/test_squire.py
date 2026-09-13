@@ -7,6 +7,18 @@ from pathlib import Path
 SQUIRE = Path(__file__).resolve().parents[1] / "squire.py"
 DOWN = {**os.environ, "SQUIRE_OLLAMA": "http://127.0.0.1:1"}  # nothing listens on port 1
 
+# Temp repos get their own identity and ignore the machine's git config. A CI runner has no
+# user.name/email, so `git commit` there exits 128. These tests once passed only on machines
+# that happened to have a global identity (the CI run failed, 2026-09-12).
+GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_AUTHOR_NAME": "squire tests", "GIT_AUTHOR_EMAIL": "tests@example.invalid",
+           "GIT_COMMITTER_NAME": "squire tests", "GIT_COMMITTER_EMAIL": "tests@example.invalid"}
+
+
+def git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
+                   check=True, env=GIT_ENV)
+
 
 def run(*args, stdin=None, env=None):
     return subprocess.run([sys.executable, str(SQUIRE), *args], input=stdin, text=True,
@@ -55,18 +67,18 @@ def test_json_mode_emits_valid_json_with_required_fields():
 
 
 def test_diff_reports_no_diff_on_clean_repo(tmp_path):
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "commit", "-q", "--allow-empty", "-m", "init")
     p = subprocess.run([sys.executable, str(SQUIRE), "diff"], cwd=tmp_path, text=True,
                        capture_output=True, env=DOWN, timeout=60)
     assert "no diff" in p.stdout
 
 
 def test_diff_shows_real_stat_even_when_model_is_down(tmp_path):
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    git(tmp_path, "init", "-q")
     (tmp_path / "f.txt").write_text("a\n")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "f.txt"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True)
+    git(tmp_path, "add", "f.txt")
+    git(tmp_path, "commit", "-q", "-m", "init")
     (tmp_path / "f.txt").write_text("a\nb\n")
     p = subprocess.run([sys.executable, str(SQUIRE), "diff"], cwd=tmp_path, text=True,
                        capture_output=True, env=DOWN, timeout=60)

@@ -3,6 +3,12 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Tests: the `squire diff` tests' temporary git repos now carry their own identity and ignore
+  the machine's git config (`GIT_CONFIG_GLOBAL=/dev/null`, no signing). CI runners have no
+  `user.name`/`user.email`, so `git commit` exited 128 and CI failed on every push; the tests had
+  passed only on machines with a global identity. Reproduced locally with no identity before fixing.
+
 ### Added
 - Branding: hand-written SVG logo/wordmark (light + dark, `docs/assets/`), icon-only mark,
   1280x640 social-preview source + rendered PNG, tagline "Offload the bulk, keep the context."
