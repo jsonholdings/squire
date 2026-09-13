@@ -36,5 +36,4 @@ See [measuring-savings.md](measuring-savings.md).
 Yes, all implemented as of v0.2.0 — see [commands.md](commands.md).
 
 **What license is this under?**
-Not decided yet (MIT or Apache-2.0) — see the README. A release won't be tagged without a
-`LICENSE` file; `scripts/scrub_check.py --release` enforces that.
+Apache-2.0 (owner decision 2026-09-12) — see the README and `LICENSE`.

@@ -3,6 +3,8 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.2.5] - 2026-09-12
 ### Fixed
 - CI: install `librsvg2-bin` on the runner. `tests/test_logo_assets.py` renders the logo with
   `rsvg-convert`, which `ubuntu-latest` lacks, so the logo staleness control failed on every
