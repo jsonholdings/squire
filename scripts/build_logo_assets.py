@@ -169,14 +169,17 @@ def check():
         print("STALE: logo-source.svg changed since the assets were built -- "
               "run scripts/build_logo_assets.py")
         return 1
-    src_mtime = os.path.getmtime(SOURCE)
     for path in OUTPUTS:
         if not os.path.isfile(path):
             print("STALE: %s is missing" % os.path.relpath(path, HERE))
             return 1
-        if os.path.getmtime(path) < src_mtime:
-            print("STALE: %s is older than logo-source.svg on disk" % os.path.relpath(path, HERE))
-            return 1
+    # Freshness is decided by the source hash above, not file mtimes: a fresh git
+    # checkout gives every file the same checkout-time mtime in no guaranteed order,
+    # so an mtime-ordering check (outputs must be newer than the source) is flaky by
+    # construction -- it failed CI on a clean clone (run 34734762115) though the
+    # outputs matched a manifest built from the same source. Rendered-byte comparison
+    # is deliberately avoided too: librsvg version differences make PNG output
+    # non-reproducible across machines (see module docstring).
     print("all logo assets are current")
     return 0
 

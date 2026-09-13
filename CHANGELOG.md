@@ -6,6 +6,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.2.5] - 2026-09-12
 ### Fixed
+- `scripts/build_logo_assets.py --check` compared output file mtimes to the source svg's
+  mtime, which is flaky by construction: a fresh git checkout gives every file the same
+  checkout-time mtime in no guaranteed order, so the ordering check can fail even when
+  outputs match the recorded source hash. Failed CI on run 34734762115 on a clean clone.
+  Freshness is now decided by the source hash alone; rendered-byte comparison stays
+  deliberately unused (librsvg version differences make PNG output non-reproducible
+  across machines).
 - CI: install `librsvg2-bin` on the runner. `tests/test_logo_assets.py` renders the logo with
   `rsvg-convert`, which `ubuntu-latest` lacks, so the logo staleness control failed on every
   matrix job (FileNotFoundError) while passing locally.
