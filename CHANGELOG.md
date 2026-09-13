@@ -3,6 +3,11 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- CI: install `librsvg2-bin` on the runner. `tests/test_logo_assets.py` renders the logo with
+  `rsvg-convert`, which `ubuntu-latest` lacks, so the logo staleness control failed on every
+  matrix job (FileNotFoundError) while passing locally.
+
 ### Added
 - Single-source logo build: `docs/assets/logo-source.svg` is now the only hand-maintained
   logo file. `scripts/build_logo_assets.py` regenerates `icon.svg`, `logo-light.svg`,
