@@ -3,7 +3,100 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.2.15] - 2026-09-13
+### Added
+- **GPU hand-off with NCP-ArchPreview (2026-09-13).** `llm()` and `embed()` now check
+  `~/.squire/gpu-paused.json` before touching the network. When another local GPU consumer (e.g.
+  `ncp up` from the new `ncp-archpreview` infra asset) has written that flag with its owner name
+  and pid, Squire returns its normal `UNKNOWN` result (`"model busy (GPU in use by <owner>)"`,
+  or a `BackendError` with the same text for `embed()`) instead of calling Ollama. A flag whose
+  pid is no longer alive is stale and is removed automatically (`gpu_paused_by()`), so a crashed
+  owner never wedges Squire permanently. `squire run` passthrough (no model call for short
+  output) is unaffected. 3 new tests in `tests/test_squire.py`
+  (`test_llm_returns_unknown_when_gpu_paused`, `test_embed_raises_when_gpu_paused`,
+  `test_gpu_paused_by_ignores_stale_pid`) plus a control proving the check can return "not
+  paused" too.
+- **GPU-pause is backend-aware (owner follow-up, 2026-09-13).** A container's docker-reported
+  pid lives in the HOST pid namespace and was invisible to a plain `os.kill` from inside Claude
+  Code's sandboxed Bash tool (`_docker_pid_alive()` now falls back to
+  `flatpak-spawn --host kill -0`, same escape `gpu_free_mib()` already uses). Also: the pause
+  must not block Squire from calling NCP-ArchPreview's own OpenAI-compatible API when Squire is
+  deliberately benchmarked against it (`SQUIRE_BACKEND=openai` +
+  `SQUIRE_OPENAI_BASE` pointed at the paused owner's own server) -- only Ollama, or an `openai`
+  backend pointed at some OTHER server, is short-circuited. `ncp up` now writes `api_base` into
+  the flag for this comparison. 3 more tests + controls
+  (`test_pid_alive_falls_back_to_flatpak_spawn_host`,
+  `test_gpu_pause_does_not_block_calls_to_the_paused_owners_own_api`,
+  `test_gpu_pause_still_blocks_openai_backend_pointed_elsewhere`).
+
 ### Fixed
+- **Two S14 defects found in live use (2026-09-13).** (1) `squire run` ledger rows carried
+  `exit_code: None` for every row even though `squire run` prints the real subprocess exit code
+  to the user -- `log_call` had no `exit_code`/`duration_s` fields at all, so
+  `squire_report.py`/benchmarks could never audit a run's outcome from the ledger. `log_call` now
+  accepts both, and `cmd_run` records the real `p.returncode` and wall-clock duration on its
+  ledger row. (2) The run summarizer's verify pass compared the final summary against
+  `text[-CHUNK:]` -- only the LAST chunk of a multi-chunk input -- so a true claim drawn from an
+  EARLIER chunk (a 5,604-line passing smoke-test log, one early line mentioning a handled
+  `JSONDecodeError`) was flagged as a false "not mentioned in the source", printed as an
+  off-topic-looking last line on an otherwise-correct summary. `condense`/`condense_verified` are
+  now built on a shared `_condense_core` that returns the per-chunk notes; the verify check now
+  compares against the notes (which together cover the whole input) instead of a tail slice of
+  the raw text when the input was chunked. 4 new tests + controls in `tests/test_squire.py`
+  (`test_ledger_records_run_exit_code_and_duration`,
+  `test_condense_verified_checks_against_full_notes_not_tail_slice` +
+  `test_condense_verified_single_chunk_checks_raw_text_control`); 125/125 green.
+
+### Added
+- **Regression test for the S12 worker-heartbeat fix (S13).** `tests/test_queue.py` gained
+  `test_heartbeat_thread_keeps_worker_alive_through_a_long_job` (in-process, monkeypatched
+  `_run_queued_job` sleeps past a small `HEARTBEAT_STALE_S` so the test runs in ~2.5s) plus a
+  control, `test_control_heartbeat_goes_stale_without_the_refresh_thread`, that reproduces
+  the pre-S12 shape (heartbeat written once, nothing refreshing it) and proves the same
+  staleness check CAN go stale -- the S12 fix had no automated coverage before this, only a
+  live repro recorded in docs/BENCHMARK.md.
+- **`scripts/benchmark.py --mode interleave` (S13).** Re-measures sync vs queue latency with
+  both arms alternating within the same run instead of S12's mismatched comparison (queue
+  measured live, sync numbers reused unchanged from an earlier S6b run under different
+  load). See docs/BENCHMARK.md's S13 section for the corrected numbers and recommendation
+  (unchanged: no guidance change).
+### Fixed
+- **`squire worker`'s heartbeat went stale during normal, successful jobs (S12).** The
+  heartbeat was written once per loop iteration, BEFORE claiming a job, so any job whose
+  model call ran longer than `HEARTBEAT_STALE_S` (default 15s) let the heartbeat go stale
+  WHILE the worker was actively working -- `squire status`/`squire wait` then reported
+  `UNKNOWN (no worker heartbeat)` for a job running normally. Found via
+  `scripts/benchmark.py --mode queue`: 14b calls routinely take 12-70s, comfortably longer
+  than 15s, making this a near-certain false UNKNOWN on real usage, not an edge case.
+  Reproduced: pre-fix, `squire sum squire.py` through the queue returned `UNKNOWN` at
+  16.18s; post-fix, `RESULT` at 20.19s. Fixed with a background thread that refreshes the
+  heartbeat on a fixed cadence independent of job duration. `python3.13 -m pytest -q`: 120
+  passed (verified, unaffected).
+- **`squire grep` reliably fast/bounded, not a silent all-workstation stall (S11).** Root cause,
+  proven from real production ledger rows: two `squire grep` calls tonight logged
+  `status=timeout, gen_s=600.1` -- exactly the OLD embed HTTP timeout, proving one embedding
+  call to Ollama genuinely hung for its full 600s. Because `embed()` shared the SAME flock
+  (`llm.lock`) as `llm()` (chat generation), that one hung embed call blocked EVERY other
+  squire invocation on the workstation (run/sum/ask/diff/grep) for up to 10 minutes -- the
+  actual cause of "~6 agents fell back to raw grep" tonight. Fixed: `embed()` now uses its own
+  lock file (`EMBED_LOCK_PATH`, default `~/.squire/embed.lock`, `SQUIRE_EMBED_LOCK`) with its
+  own wait timeout (`EMBED_LOCK_TIMEOUT`, default 60s, `SQUIRE_EMBED_LOCK_TIMEOUT`) so a slow
+  chat generation and an embedding call never queue behind each other. The embed HTTP call
+  itself now times out at 60s (`EMBED_HTTP_TIMEOUT`, `SQUIRE_EMBED_HTTP_TIMEOUT`) instead of
+  600s -- a 10x bound reduction, live-reproduced during this fix (a genuinely degraded backend
+  now fails at 60.17s instead of hanging past 600s). Live-verified with fake-server-controlled
+  tests: with a chat lock held for 5s, embed (separate lock) still completes in <4s (was: would
+  have queued the full 5s+); 7/7 new tests green (`tests/test_squire.py`, S11 section).
+- **`squire grep --timeout S` returns the best PARTIAL hits, never nothing, on a deadline
+  (S11).** A stuck/slow backend used to make grep run indefinitely (or exit 2 with zero
+  results); callers gave up and fell back to raw grep, defeating the squire mandate. `--timeout`
+  (or `SQUIRE_GREP_TIMEOUT`) caps wall-clock re-embedding time; chunks embedded before the
+  deadline are cached and searched, output carries `"partial": true` plus a visible `PARTIAL`
+  note, and a ledger row is logged with `status: "partial"` so a timeout is never silently
+  absent from `squire_usage_report.py` (same principle as S10's hard-failure logging, applied
+  to a graceful deadline). Indexed-file count is now always printed on every path (was already
+  true for the success/error paths; confirmed unchanged for partial).
 - **Corrected headline: benchmark tokens-saved figure overclaimed (S8c).** The published
   headline (92.9%, n=118) pooled two workload types with near-equal sample sizes but very
   different savings profiles (whole-file summarization ~96%, live noisy-command wrapping

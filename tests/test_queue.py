@@ -13,6 +13,9 @@ from pathlib import Path
 SQUIRE = Path(__file__).resolve().parents[1] / "squire.py"
 DOWN = {**os.environ, "SQUIRE_OLLAMA": "http://127.0.0.1:1"}
 
+sys.path.insert(0, str(SQUIRE.parent))
+import squire as sq  # noqa: E402
+
 
 def run(*args, env=None, timeout=60):
     return subprocess.run([sys.executable, str(SQUIRE), *args], text=True, input="",
@@ -174,3 +177,55 @@ def test_ledger_row_from_queue_worker_carries_source_and_job_fields(tmp_path):
     rows = [json.loads(ln) for ln in open(env["SQUIRE_LEDGER"]) if ln.strip()]
     assert rows and rows[0]["cmd"] == "queue:sum"
     assert "queue_wait_s" in rows[0] and "gen_s" in rows[0]
+
+
+# ---- S13: regression test for the S12 heartbeat-thread fix (in-process, monkeypatched squire
+# module so the fake "slow job" never touches a real backend and the test finishes in ~2-3s
+# instead of waiting out a real HEARTBEAT_STALE_S=15). Isolates QUEUE_DB/WORKER_HEARTBEAT per
+# test via monkeypatch.setattr on the module globals (they're read at import time from env, so
+# subprocess env vars don't affect an already-imported `sq`); SQUIRE_LLM_LOCK isolation is not
+# needed here because _run_queued_job is replaced outright -- no real llm()/condense() call
+# happens, so no process on this workstation contends for that lock.
+
+def _insert_job(cmd="sum"):
+    conn = sq._queue_conn()
+    now = time.time()
+    conn.execute("INSERT INTO jobs (cmd, args, input_text, cwd, status, enqueued_at, attempts) "
+                "VALUES (?,?,?,?,'queued',?,0)", (cmd, "[]", "hi", None, now))
+    conn.commit()
+    conn.close()
+
+
+def test_heartbeat_thread_keeps_worker_alive_through_a_long_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(sq, "QUEUE_DB", str(tmp_path / "queue.db"))
+    monkeypatch.setattr(sq, "WORKER_HEARTBEAT", str(tmp_path / "worker.heartbeat"))
+    monkeypatch.setattr(sq, "HEARTBEAT_STALE_S", 1.0)  # small: a 2.5s job would go stale w/o the fix
+    _insert_job()
+    job_duration_s = 2.5
+    sampled_alive = []
+
+    def slow_job(row):
+        end = time.time() + job_duration_s
+        while time.time() < end:
+            sampled_alive.append(sq._worker_alive())
+            time.sleep(0.2)
+        return True, "done"
+
+    monkeypatch.setattr(sq, "_run_queued_job", slow_job)
+    sq.cmd_worker(["--once"])  # runs the real heartbeat thread + real loop, in-process
+    assert len(sampled_alive) >= 5  # actually sampled during the job, not skipped
+    assert all(sampled_alive)  # never went stale/UNKNOWN while the job was running
+
+
+def test_control_heartbeat_goes_stale_without_the_refresh_thread(tmp_path, monkeypatch):
+    # Control (CLAUDE.md S17): reproduces the pre-S12 shape -- a heartbeat written once (as the
+    # old code did, before claiming a job) with nothing refreshing it while a job runs longer
+    # than HEARTBEAT_STALE_S. Proves the same staleness check the regression test above passes
+    # THROUGH is actually capable of going stale, i.e. the fix is what the first test exercises,
+    # not an assertion that can never fail.
+    monkeypatch.setattr(sq, "WORKER_HEARTBEAT", str(tmp_path / "worker.heartbeat"))
+    monkeypatch.setattr(sq, "HEARTBEAT_STALE_S", 1.0)
+    sq._write_heartbeat()
+    assert sq._worker_alive() is True  # fresh right after writing
+    time.sleep(1.3)  # > HEARTBEAT_STALE_S, simulating a job running with no refresh thread
+    assert sq._worker_alive() is False

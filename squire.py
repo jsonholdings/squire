@@ -11,7 +11,8 @@ vLLM), so long output is condensed locally before a session reads it.
     squire ask "question" [file|-]   answer a question from the given text only
     squire draft "instructions" [file|-]  first draft for Claude to review
     squire diff [--staged] | squire diff <ref1> <ref2>   condense a large git diff
-    squire grep "query" [path] [--top N] [--reindex]   semantic search over a repo (local embeddings)
+    squire grep "query" [path] [--top N] [--reindex] [--timeout S]   semantic search (local embeddings);
+                                 --timeout returns the best PARTIAL hits (never nothing) past the deadline
     squire triage <file>         order a HANDOFF-INBOX/BACKLOG by real age, with a guessed impact line
     squire stats                 real chars in/out logged, plus a labelled token estimate
     squire doctor                check backend, models and GPU; exit 0 ready, 2 UNKNOWN
@@ -30,7 +31,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.10"
+__version__ = "0.2.15"
 
 import datetime as _dt
 import fcntl
@@ -40,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -94,6 +96,17 @@ def is_test_row(row):
 # real backend-down/generation error.
 LLM_LOCK_PATH = os.path.expanduser(os.environ.get("SQUIRE_LLM_LOCK", "~/.squire/llm.lock"))
 LLM_LOCK_TIMEOUT = float(os.environ.get("SQUIRE_LLM_LOCK_TIMEOUT", "240"))  # max queue wait, seconds
+# 2026-09-13 S11: embed() used to share LLM_LOCK_PATH with llm() (chat generation). A single
+# `squire grep` embed call that hung talking to Ollama held that ONE shared lock for its whole
+# HTTP timeout, which used to be 600s (copied from generate's long-context use case, wrong for a
+# small embedding batch) -- blocking every OTHER squire call on the workstation (run/sum/ask/diff
+# AND every other grep) for up to 10 minutes. Root-caused from real ledger rows: two grep calls
+# tonight logged status=timeout, gen_s=600.1 -- exactly the old embed HTTP timeout, proving the
+# request itself hung rather than the lock queue. Separate lock + much shorter HTTP timeout below.
+EMBED_LOCK_PATH = os.path.expanduser(os.environ.get("SQUIRE_EMBED_LOCK", os.path.join(os.path.dirname(LLM_LOCK_PATH), "embed.lock")))
+EMBED_LOCK_TIMEOUT = float(os.environ.get("SQUIRE_EMBED_LOCK_TIMEOUT", "60"))
+EMBED_HTTP_TIMEOUT = float(os.environ.get("SQUIRE_EMBED_HTTP_TIMEOUT", "60"))
+GREP_TIMEOUT = float(os.environ.get("SQUIRE_GREP_TIMEOUT", "0") or 0) or None  # 0/unset = no deadline
 CHARS_PER_TOKEN = 4      # rough estimate for English text; stats labels this explicitly as an estimate
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -133,7 +146,7 @@ def check_local(url):
 
 
 def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None, source=None, job=None,
-             status=None):
+             status=None, exit_code=None, duration_s=None):
     # chars_in/out/ts are real, computed facts. The token estimate derived from them in `stats`
     # is NOT -- the two must never be presented as the same kind of claim.
     # queue_wait_s/gen_s (2026-09-13, S1) split how long a call sat waiting for the local lock
@@ -143,11 +156,16 @@ def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None
     # path writes, so S6 can compare sync vs queued using one set of rows.
     # `status` (2026-09-13, S10) records WHY a call failed (e.g. "timeout") separately from
     # `source` (which is provenance: cli/test/queue) so a stuck call is visible to
-    # squire_usage_report.py as a distinct, named outcome instead of just backend_ok=False.
+    # squire_report.py as a distinct, named outcome instead of just backend_ok=False.
+    # `exit_code`/`duration_s` (2026-09-13, S14) record the REAL subprocess exit code and total
+    # wall time of a `squire run` invocation. Before this, every "run" ledger row carried
+    # exit=None even though `squire run` prints the real code to the user (`[squire] exit=N`) --
+    # the ledger had no way to audit it after the fact. gen_s/queue_wait_s only cover the LLM
+    # summarization call, not the wrapped command, so a separate field is needed.
     row = {"ts": time.time(), "cmd": cmd, "chars_in": chars_in, "chars_out": chars_out,
            "backend_ok": backend_ok, "queue_wait_s": queue_wait_s, "gen_s": gen_s,
            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "source": source or SOURCE,
-           "status": status}
+           "status": status, "exit_code": exit_code, "duration_s": duration_s}
     if job:
         row.update(job_id=job["id"], enqueued_at=job["enqueued_at"], started_at=job["started_at"],
                    finished_at=job["finished_at"])
@@ -164,15 +182,25 @@ class _LlmLock:
     on this workstation (flock on a shared file). One in-flight generate/embed call at a time
     avoids Ollama trying to run several large-context requests concurrently on one GPU, which
     degrades into GPU/CPU offload thrashing rather than clean queueing. Gives up after
-    LLM_LOCK_TIMEOUT seconds of waiting rather than blocking forever; the caller decides what a
-    failed acquisition means (fail fast, labelled distinctly from a generation-time failure)."""
+    `timeout` seconds of waiting rather than blocking forever; the caller decides what a
+    failed acquisition means (fail fast, labelled distinctly from a generation-time failure).
+
+    `path`/`timeout` default to the chat-generation lock (LLM_LOCK_PATH/LLM_LOCK_TIMEOUT).
+    embed() passes its own EMBED_LOCK_PATH/EMBED_LOCK_TIMEOUT (2026-09-13, S11) so a slow chat
+    generation and a `squire grep` embedding call never queue behind each other -- they used to
+    share this same lock, so a single hung embed call could block every other squire invocation
+    on the workstation for as long as the embed HTTP call took to time out."""
+
+    def __init__(self, path=None, timeout=None):
+        self.path = path or LLM_LOCK_PATH
+        self.timeout = LLM_LOCK_TIMEOUT if timeout is None else timeout
 
     def __enter__(self):
         self.wait_s = 0.0
         self._f = None
         try:
-            os.makedirs(os.path.dirname(LLM_LOCK_PATH), mode=0o700, exist_ok=True)
-            self._f = open(LLM_LOCK_PATH, "a+")
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            self._f = open(self.path, "a+")
         except OSError:
             return self  # no lock available (e.g. read-only fs); proceed unserialized
         start = time.monotonic()
@@ -183,7 +211,7 @@ class _LlmLock:
                 break
             except BlockingIOError:
                 self.wait_s = time.monotonic() - start
-                if self.wait_s >= LLM_LOCK_TIMEOUT:
+                if self.wait_s >= self.timeout:
                     self.acquired = False
                     break
                 time.sleep(0.25)
@@ -245,6 +273,66 @@ def pick_model(installed, free_mib):
 
 _resolved_model = None
 
+GPU_PAUSE_FLAG = os.path.expanduser("~/.squire/gpu-paused.json")
+
+
+def _docker_pid_alive(pid):
+    """True if `pid` is running. Named distinctly from the existing `_pid_alive` (used by
+    `_worker_alive()` for squire's OWN worker process, same pid namespace as squire itself --
+    a plain os.kill is correct there and must not be changed). NCP-ArchPreview's pid comes from
+    `docker inspect`, which reports the pid in the HOST pid namespace -- invisible to a plain
+    os.kill from inside Claude Code's sandboxed Bash tool (confirmed 2026-09-13:
+    ProcessLookupError against a container pid that was very much still running). Falls back to
+    `flatpak-spawn --host kill -0` (same escape gpu_free_mib() already uses for nvidia-smi) so
+    the check is correct from both contexts. Any ambiguous failure (PermissionError,
+    flatpak-spawn missing) is treated as "still alive" -- a false "paused" costs one skipped
+    Squire call; a false "stale" would wedge nothing but wrongly let Squire fight NCP for the
+    GPU."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return True
+    try:
+        r = subprocess.run(["flatpak-spawn", "--host", "kill", "-0", str(pid)],
+                            capture_output=True, timeout=5)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def gpu_paused_by():
+    """Returns the owner name from ~/.squire/gpu-paused.json if another process (e.g.
+    NCP-ArchPreview's `ncp up`) currently owns the GPU, or None if unpaused. A flag whose
+    recorded pid is no longer alive is stale -- it is removed and treated as unpaused, so a
+    crashed owner never wedges Squire's model calls permanently.
+
+    This must NOT block a call that is itself going TO the paused owner: when Squire is
+    benchmarked with NCP-ArchPreview as its own backend (SQUIRE_BACKEND=openai,
+    SQUIRE_OPENAI_BASE pointed at the same server `ncp up` wrote into the flag's "api_base"),
+    the pause exists to keep Ollama off the GPU while NCP holds it -- it is not a block on
+    talking to NCP itself. Only Ollama calls (the default backend), or an "openai" backend
+    pointed at some OTHER server, are short-circuited."""
+    try:
+        with open(GPU_PAUSE_FLAG) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    pid = data.get("pid")
+    if pid is not None and not _docker_pid_alive(pid):
+        try:
+            os.remove(GPU_PAUSE_FLAG)
+        except OSError:
+            pass
+        return None
+    if BACKEND == "openai":
+        flag_base = (data.get("api_base") or "").rstrip("/")
+        if flag_base and OPENAI_BASE.rstrip("/") == flag_base:
+            return None  # this call IS the paused owner's own API; let it through
+    return data.get("owner") or "another process"
+
 
 def model():
     global _resolved_model
@@ -272,6 +360,9 @@ def get_call_timing():
 
 def llm(prompt, max_tokens=300):
     prompt = redact(prompt)
+    paused_owner = gpu_paused_by()
+    if paused_owner:
+        return f"UNKNOWN: model busy (GPU in use by {paused_owner})"[:300]
     with _LlmLock() as lock:
         _call_timing_totals["queue_wait_s"] += lock.wait_s
         if not getattr(lock, "acquired", True):
@@ -300,20 +391,23 @@ def llm(prompt, max_tokens=300):
 def embed(texts, kind="document"):
     """Embed a batch; raises BackendError on any failure so callers report UNKNOWN."""
     texts = [redact(t) for t in texts]
+    paused_owner = gpu_paused_by()
+    if paused_owner:
+        raise BackendError(f"model busy (GPU in use by {paused_owner})")
     if "nomic" in EMBED_MODEL:
         # nomic-embed-text is trained with task prefixes; without them ranking is noticeably worse.
         texts = [f"search_{kind}: {t}" for t in texts]
     try:
-        with _LlmLock() as lock:
+        with _LlmLock(EMBED_LOCK_PATH, EMBED_LOCK_TIMEOUT) as lock:
             _call_timing_totals["queue_wait_s"] += lock.wait_s
             if not getattr(lock, "acquired", True):
                 raise BackendError(f"local model busy (queued {round(lock.wait_s, 1)}s, gave up)")
             gen_start = time.monotonic()
             try:
                 if BACKEND == "openai":
-                    data = _post(OPENAI_BASE.rstrip("/") + "/embeddings", {"model": EMBED_MODEL, "input": texts}, 600)
+                    data = _post(OPENAI_BASE.rstrip("/") + "/embeddings", {"model": EMBED_MODEL, "input": texts}, EMBED_HTTP_TIMEOUT)
                     return [d["embedding"] for d in data["data"]]
-                data = _post(HOST + "/api/embed", {"model": EMBED_MODEL, "input": texts}, 600)
+                data = _post(HOST + "/api/embed", {"model": EMBED_MODEL, "input": texts}, EMBED_HTTP_TIMEOUT)
                 return data["embeddings"]
             finally:
                 _call_timing_totals["gen_s"] += time.monotonic() - gen_start
@@ -327,30 +421,49 @@ def chunks(text):
     return [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or [""]
 
 
-def condense(text, task, max_tokens=300):
+def _condense_core(text, task, max_tokens=300):
+    """Shared chunk/summarize logic for condense() and condense_verified(). Returns
+    (summary, notes) where `notes` is None for a single-chunk input (the raw text itself is the
+    full source) or the list of per-chunk partial notes when the input was split -- those notes,
+    together, cover the WHOLE input, unlike any single CHUNK-sized slice of the raw text."""
     parts = chunks(text)
     if len(parts) == 1:
-        return llm(f"{task}\n\n---\n{parts[0]}\n---", max_tokens)
+        return llm(f"{task}\n\n---\n{parts[0]}\n---", max_tokens), None
     notes = [llm(f"{task} (part {i + 1}/{len(parts)}; be brief)\n\n---\n{p}\n---", 150)
              for i, p in enumerate(parts)]
     if any(n.startswith("UNKNOWN") for n in notes):
-        return next(n for n in notes if n.startswith("UNKNOWN"))
-    return llm(f"{task}\nCombine these partial notes into one answer:\n\n" + "\n".join(notes), max_tokens)
+        return next(n for n in notes if n.startswith("UNKNOWN")), notes
+    return llm(f"{task}\nCombine these partial notes into one answer:\n\n" + "\n".join(notes), max_tokens), notes
+
+
+def condense(text, task, max_tokens=300):
+    return _condense_core(text, task, max_tokens)[0]
 
 
 def condense_verified(text, task, max_tokens=300):
     """condense() plus a second local pass checking the summary against the source.
     Used where an inaccurate summary would mislead a real decision (test failures, diffs). A
     disagreement is appended visibly, never hidden or silently retried. The check is itself
-    ASSUMED: a quality signal, not a correctness guarantee."""
-    summary = condense(text, task, max_tokens)
+    ASSUMED: a quality signal, not a correctness guarantee.
+
+    2026-09-13, S14: the check used to compare the final summary against `text[-CHUNK:]` -- only
+    the LAST CHUNK chars of the raw input. For input bigger than one chunk (the whole point of
+    the multi-chunk path below), the summary can legitimately include a point drawn from an
+    EARLIER chunk (a 5,604-line passing smoke-test log, one early line mentioning a handled
+    JSONDecodeError) that the truncated tail slice never contained -- the check then reported a
+    false "not mentioned in the source", read by a user as an off-topic non-sequitur bolted onto
+    an otherwise-correct summary. The notes computed below were each derived by reading the FULL
+    text in windows, so their concatenation -- not a tail slice of the raw text -- is what the
+    verify check should compare the final summary against whenever the input was chunked."""
+    summary, notes = _condense_core(text, task, max_tokens)
     if summary.startswith("UNKNOWN"):
         return summary, None
+    check_source = "\n".join(notes) if notes else text
     check = llm(
         "SOURCE (truncated) and a SUMMARY of it follow. Reply with exactly 'OK' if the summary "
         "invents nothing not supported by the source and omits no failure/error the source contains. "
         "Otherwise reply with one short sentence naming the specific inaccuracy.\n\n"
-        f"SOURCE:\n{text[-CHUNK:]}\n\nSUMMARY:\n{summary}", 60)
+        f"SOURCE:\n{check_source[-CHUNK:]}\n\nSUMMARY:\n{summary}", 60)
     if check.startswith("UNKNOWN"):
         return summary, None
     flag = None if check.strip().rstrip(".").upper() == "OK" else check.strip()
@@ -409,6 +522,7 @@ def cmd_run(argv):
     # run breaks on nested flatpak-spawn/docker invocations"). squire's contract is capture-then-
     # summarize, never interactive, so stdin is never useful here -- close it up front.
     timeout_s = float(os.environ.get("SQUIRE_RUN_TIMEOUT", "0") or 0) or None
+    run_start = time.monotonic()
     try:
         p = subprocess.run(argv if len(argv) > 1 else argv[0], shell=len(argv) == 1,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -437,7 +551,8 @@ def cmd_run(argv):
                                           "Say 'no errors seen' only if there are none. Never invent names.")
         ok = not summary.startswith("UNKNOWN")
         wait_s, gen_s = get_call_timing()
-        log_call("run", len(out), len(summary), ok, wait_s, gen_s)
+        log_call("run", len(out), len(summary), ok, wait_s, gen_s,
+                  exit_code=p.returncode, duration_s=round(time.monotonic() - run_start, 2))
         emit("run", p.returncode, "\n".join(lines[-TAIL:]), summary, ok, json_mode, flag)
     sys.exit(p.returncode)
 
@@ -540,8 +655,15 @@ def cmd_grep(argv):
     json_mode, argv = pop_flag(argv, "--json")
     reindex, argv = pop_flag(argv, "--reindex")
     top, argv = pop_opt(argv, "--top", "15")
+    # 2026-09-13, S11: a stuck/slow embedding backend used to make `squire grep` run (or wait on
+    # the lock) indefinitely with nothing to show for it -- callers gave up and fell back to raw
+    # grep, defeating the squire mandate. --timeout (or SQUIRE_GREP_TIMEOUT) caps wall-clock time
+    # spent re-embedding; whatever chunks finished before the deadline are cached and searched, so
+    # a timeout still returns the BEST PARTIAL hits plus a visible "partial" note, never nothing.
+    timeout_opt, argv = pop_opt(argv, "--timeout", None)
+    grep_timeout = float(timeout_opt) if timeout_opt is not None else GREP_TIMEOUT
     if not argv:
-        sys.exit('usage: squire grep "query" [path] [--top N] [--reindex] [--json]')
+        sys.exit('usage: squire grep "query" [path] [--top N] [--reindex] [--timeout S] [--json]')
     query, path = argv[0], (argv[1] if len(argv) > 1 else ".")
     path = os.path.abspath(path)
     root = repo_root(path) if os.path.isdir(path) else None
@@ -561,6 +683,7 @@ def cmd_grep(argv):
             cache = {}
     header = {"root": root, "files_indexed": len(files), "git": in_git}
     grep_t0 = time.monotonic()
+    partial = False
     try:
         todo = []
         for rel, mtime, size in files:
@@ -576,11 +699,16 @@ def cmd_grep(argv):
                 continue
             cache[rel] = {"mtime": mtime, "size": size, "chunks": []}
             todo += [(rel, s, e, f"{rel}\n{body}") for s, e, body in file_windows(text)]
+        done = 0
         for i in range(0, len(todo), GREP_BATCH):
+            if grep_timeout is not None and (time.monotonic() - grep_t0) >= grep_timeout:
+                partial = True
+                break
             batch = todo[i:i + GREP_BATCH]
             vecs = embed([t[3][:6000] for t in batch])
             for (rel, s, e, _), v in zip(batch, vecs):
                 cache[rel]["chunks"].append({"s": s, "e": e, "v": _norm(v)})
+            done = i + len(batch)
             if not json_mode and len(todo) > GREP_BATCH and (i // GREP_BATCH) % 10 == 0:
                 print(f"[squire] embedding {min(i + GREP_BATCH, len(todo))}/{len(todo)} chunks...", file=sys.stderr)
         live = {f[0] for f in files}
@@ -591,7 +719,20 @@ def cmd_grep(argv):
                 f.write(json.dumps(cache))
             if in_git:
                 exclude_cache(root)
-        qv = _norm(embed([query])[0])
+        if partial:
+            # Ran out of time before every chunk was embedded. Still search whatever IS embedded
+            # (files not yet re-embedded fall out of scoring below since their cache entry has
+            # empty/stale chunks) rather than returning nothing -- best partial hits, clearly
+            # labelled, plus a ledger row so a timeout is visible instead of silently absent
+            # (same S10 principle applied to a graceful deadline instead of a hard backend error).
+            header["reembedded_chunks"] = done
+            header["skipped_chunks"] = len(todo) - done
+            try:
+                qv = _norm(embed([query])[0])
+            except BackendError:
+                qv = None  # even the query embed didn't make it back before the deadline
+        else:
+            qv = _norm(embed([query])[0])
     except BackendError as e:
         # A stuck/timed-out embedding call used to die here with NO ledger row at all -- from
         # the ledger's side a stuck `squire grep` was indistinguishable from one never run
@@ -607,14 +748,17 @@ def cmd_grep(argv):
             print(f"[squire] grep indexed {len(files)} files under {root}")
             print(f"[squire] {header['error']}")
         sys.exit(2)
-    header["reembedded_chunks"] = len(todo)
+    if not partial:
+        header["reembedded_chunks"] = len(todo)
+    header["partial"] = partial
     scored = []
-    for rel, ent in cache.items():
-        if rel not in {f[0] for f in files}:
-            continue
-        best = max(((sum(a * b for a, b in zip(qv, c["v"])), c) for c in ent["chunks"]), default=None, key=lambda t: t[0])
-        if best:
-            scored.append((best[0], rel, best[1]["s"], best[1]["e"]))
+    if qv is not None:
+        for rel, ent in cache.items():
+            if rel not in {f[0] for f in files}:
+                continue
+            best = max(((sum(a * b for a, b in zip(qv, c["v"])), c) for c in ent["chunks"]), default=None, key=lambda t: t[0])
+            if best:
+                scored.append((best[0], rel, best[1]["s"], best[1]["e"]))
     scored.sort(reverse=True)
     results = []
     for score, rel, s, e in scored[:int(top)]:
@@ -624,12 +768,15 @@ def cmd_grep(argv):
             lines = []
         snippet = next((ln.strip() for ln in lines if ln.strip()), "")[:120]
         results.append({"file": rel, "line": s, "end": e, "score": round(score, 3), "snippet": snippet})
-    log_call("grep", sum(f[2] for f in files), len(json.dumps(results)), True)
+    grep_dur = round(time.monotonic() - grep_t0, 1)
+    log_call("grep", sum(f[2] for f in files), len(json.dumps(results)), qv is not None,
+             gen_s=grep_dur, status="partial" if partial else None)
     if json_mode:
-        print(json.dumps({"cmd": "grep", **header, "results": results, "backend_ok": True, "assumed": True}))
+        print(json.dumps({"cmd": "grep", **header, "results": results, "backend_ok": qv is not None, "assumed": True}))
         return
-    print(f"[squire] grep indexed {len(files)} files under {root} ({len(todo)} chunks re-embedded); "
-          f"ranking is ASSUMED (semantic similarity), verify before relying on it")
+    note = " -- PARTIAL: timed out before all chunks re-embedded, showing best hits so far" if partial else ""
+    print(f"[squire] grep indexed {len(files)} files under {root} ({header.get('reembedded_chunks', 0)} chunks "
+          f"re-embedded{note}); ranking is ASSUMED (semantic similarity), verify before relying on it")
     for r in results:
         print(f"{r['file']}:{r['line']}  ({r['score']})  {r['snippet']}")
 
@@ -872,35 +1019,57 @@ def _claim_next_job(conn):
 
 
 def cmd_worker(argv):
+    """S12 fix: the heartbeat used to be written only once per loop iteration, BEFORE
+    claiming a job -- so a job whose model call ran longer than HEARTBEAT_STALE_S
+    (default 15s) let the heartbeat go stale WHILE THE WORKER WAS ACTIVELY WORKING,
+    and `squire status`/`squire wait` reported UNKNOWN ("no worker heartbeat") for a
+    job that was in fact running normally. Found via scripts/benchmark.py --mode
+    queue: 14b model calls routinely take 12-70s (docs/BENCHMARK.md latency table),
+    all comfortably longer than the old 15s staleness window, so this was a
+    near-certain false UNKNOWN on any real job, not an edge case. Fix: a background
+    thread refreshes the heartbeat on a fixed cadence independent of job duration,
+    so staleness now only ever means "the worker process is actually gone/hung",
+    which is what it is supposed to mean."""
     _once, argv = pop_flag(argv, "--once")  # process at most one job then exit; for tests/CI
     conn = _queue_conn()
     print(f"[squire] worker started, pid={os.getpid()}, db={QUEUE_DB}")
-    while True:
-        _write_heartbeat()
-        job = _claim_next_job(conn)
-        if job is None:
+    stop_heartbeat = threading.Event()
+
+    def _heartbeat_loop():
+        while not stop_heartbeat.is_set():
+            _write_heartbeat()
+            stop_heartbeat.wait(max(1.0, HEARTBEAT_STALE_S / 3))
+
+    hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    hb_thread.start()
+    try:
+        while True:
+            job = _claim_next_job(conn)
+            if job is None:
+                if _once:
+                    return
+                time.sleep(WORKER_POLL_S)
+                continue
+            reset_call_timing()
+            try:
+                ok, out = _run_queued_job(job)
+                error = None if ok else out
+                result = out if ok else None
+            except Exception as e:  # noqa: BLE001 -- a job must never crash the worker loop
+                ok, result, error = False, None, f"{type(e).__name__}: {e}"
+            wait_s, gen_s = get_call_timing()
+            finished = time.time()
+            conn.execute("UPDATE jobs SET status=?, result=?, error=?, finished_at=?, queue_wait_s=?, gen_s=? "
+                        "WHERE id=?",
+                        ("done" if ok else "failed", result, error, finished, wait_s, gen_s, job["id"]))
+            conn.commit()
+            finished_job = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            log_call(f"queue:{job['cmd']}", len(job["input_text"] or ""), len(result or error or ""), ok,
+                     wait_s, gen_s, source="queue", job=finished_job)
             if _once:
                 return
-            time.sleep(WORKER_POLL_S)
-            continue
-        reset_call_timing()
-        try:
-            ok, out = _run_queued_job(job)
-            error = None if ok else out
-            result = out if ok else None
-        except Exception as e:  # noqa: BLE001 -- a job must never crash the worker loop
-            ok, result, error = False, None, f"{type(e).__name__}: {e}"
-        wait_s, gen_s = get_call_timing()
-        finished = time.time()
-        conn.execute("UPDATE jobs SET status=?, result=?, error=?, finished_at=?, queue_wait_s=?, gen_s=? "
-                    "WHERE id=?",
-                    ("done" if ok else "failed", result, error, finished, wait_s, gen_s, job["id"]))
-        conn.commit()
-        finished_job = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
-        log_call(f"queue:{job['cmd']}", len(job["input_text"] or ""), len(result or error or ""), ok,
-                 wait_s, gen_s, source="queue", job=finished_job)
-        if _once:
-            return
+    finally:
+        stop_heartbeat.set()
 
 
 def _job_position(conn, job):

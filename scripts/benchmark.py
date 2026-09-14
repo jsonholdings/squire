@@ -29,12 +29,16 @@ may be calling squire concurrently during this run; "concurrent load" below is
 THIS SCRIPT's own load, not exclusive access to the model. See docs/BENCHMARK.md.
 
 Usage:
-  python3 scripts/benchmark.py [--quick] [--json] [--out DIR] [--checkpoint FILE]
+  python3 scripts/benchmark.py [--quick] [--json] [--out DIR] [--checkpoint FILE] [--mode sync|queue|both]
   python3 scripts/benchmark.py --report [--checkpoint FILE] [--json]
   --quick uses N=10 (the floor) and skips the file-workload solo pass N to fit a
   timebox; full run uses N=20 solo / N=12 per concurrency level.
   --report reads the checkpoint file and prints/saves stats WITHOUT running any
   new trials (no model calls) -- use it to see numbers from a partial run.
+  --mode (S12) selects which concurrency-latency table(s) run: "sync" (default,
+  pre-S12 behavior, `squire sum` called directly), "queue" (submit+wait through one
+  foreground `squire worker`), or "both". Only affects the concurrency-latency
+  section; file/cmd/fidelity/deterministic trials are unaffected by --mode.
 Run from the squire repo root (uses squire.py in the parent of this script's dir).
 """
 import concurrent.futures
@@ -44,6 +48,7 @@ import random
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -277,6 +282,34 @@ def run_squire_sum(path):
     return payload
 
 
+def run_squire_queue_sum(path, env, wait_timeout=180):
+    """S12: submit+wait round trip for `squire sum <path>` through the job queue,
+    timed end to end from the caller's point of view (submit call + wait call), the
+    way an agent using submit/wait actually experiences latency. Requires a `squire
+    worker` already running against the same QUEUE_DB (started by the caller)."""
+    t0 = time.time()
+    sub = subprocess.run([PY, SQUIRE, "submit", "sum", path, "--json"], cwd=REPO_ROOT, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    try:
+        sub_payload = json.loads(sub.stdout.strip().splitlines()[-1])
+        job_id = sub_payload["job_id"]
+    except Exception as e:
+        return {"error": f"could not parse submit JSON: {e}", "stderr": sub.stderr[-500:],
+                "seconds": time.time() - t0}
+    wt = subprocess.run([PY, SQUIRE, "wait", str(job_id), "--timeout", str(wait_timeout), "--json"],
+                         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace")
+    seconds = time.time() - t0
+    try:
+        wait_payload = json.loads(wt.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return {"error": f"could not parse wait JSON: {e}", "stderr": wt.stderr[-500:],
+                "seconds": seconds, "job_id": job_id, "exit_code_process": wt.returncode}
+    wait_payload["seconds"] = seconds
+    wait_payload["exit_code_process"] = wt.returncode
+    return wait_payload
+
+
 def run_synthetic_squire(text, exit_code):
     script = f"import sys; print({text!r}); sys.exit({exit_code})"
     cmd = [PY, "-c", script]
@@ -425,6 +458,150 @@ def trial_concurrent_latency(workload_path, concurrency_levels, n_per_level, cp_
     return results
 
 
+def trial_concurrent_latency_queue(workload_path, concurrency_levels, n_per_level,
+                                    cp_data=None, checkpoint_path=None):
+    """S12: same solo+2/4/6 shape as trial_concurrent_latency, but each request goes
+    through `squire submit`+`squire wait` against ONE foreground `squire worker`
+    instead of calling `squire sum` directly. QUEUE_DB and the worker heartbeat are
+    isolated to a per-run temp path so this never touches the real production queue
+    (~/.squire/queue.db) or collides with another session's real jobs; the LLM lock
+    (SQUIRE_LLM_LOCK) is deliberately LEFT at its real default so lock contention is
+    measured the same way the sync path already measures it -- that contention is
+    exactly what the queue is meant to remove. Checkpointed per round like the sync
+    version, under a DIFFERENT key namespace (concurrency:queue:<level>) so it never
+    collides with or corrupts prior sync-mode checkpoint data."""
+    cp_data = cp_data or {}
+    results = {}
+    with tempfile.TemporaryDirectory(prefix="squire-bench-queue-") as tmpdir:
+        queue_env = {**ENV, "SQUIRE_QUEUE_DB": os.path.join(tmpdir, "queue.db"),
+                     "SQUIRE_WORKER_HEARTBEAT": os.path.join(tmpdir, "worker.heartbeat"),
+                     "SQUIRE_LEDGER": os.path.join(tmpdir, "ledger.jsonl")}
+        for level in [1] + concurrency_levels:
+            key = f"concurrency:queue:{level}"
+            existing_recs = cp_data.get(key, [])
+            latencies, failures = [], 0
+            for r in existing_recs:
+                latencies.extend(r["rep"]["latencies"])
+                failures += r["rep"].get("failures", 0)
+            rounds = max(1, n_per_level // level)
+            worker_proc = None
+            try:
+                if len(existing_recs) < rounds:
+                    worker_proc = subprocess.Popen([PY, SQUIRE, "worker"], cwd=REPO_ROOT, env=queue_env,
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Wait for the heartbeat file so submits aren't racing an unstarted worker.
+                    for _ in range(50):
+                        if os.path.exists(queue_env["SQUIRE_WORKER_HEARTBEAT"]):
+                            break
+                        time.sleep(0.1)
+                for round_i in range(len(existing_recs), rounds):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=level) as ex:
+                        futs = [ex.submit(run_squire_queue_sum, workload_path, queue_env) for _ in range(level)]
+                        round_results = [fut.result() for fut in futs]
+                    round_lat = [r["seconds"] for r in round_results if r.get("state") == "RESULT"]
+                    round_fail = sum(1 for r in round_results if r.get("state") != "RESULT")
+                    latencies.extend(round_lat)
+                    failures += round_fail
+                    append_checkpoint(checkpoint_path, {"key": key, "kind": "concurrency_queue", "level": level,
+                                                         "rep": {"latencies": round_lat, "failures": round_fail}})
+            finally:
+                if worker_proc is not None:
+                    worker_proc.terminate()
+                    try:
+                        worker_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        worker_proc.kill()
+                        worker_proc.wait(timeout=10)
+            results[f"concurrency_{level}"] = {
+                "n": len(latencies),
+                "p50": percentile(latencies, 0.5),
+                "p95": percentile(latencies, 0.95),
+                "failures": failures,
+                "raw_latencies": latencies,
+            }
+    return results
+
+
+def trial_interleaved_latency(workload_path, concurrency_levels, n_per_level,
+                               cp_data=None, checkpoint_path=None):
+    """S13: closes the S12 gap where sync's concurrency-1/2 numbers were reused from an
+    EARLIER run (S6b) instead of being measured in the same session as queue's, so the
+    two arms were never a fair A/B (different load, different point in time). Here sync
+    and queue rounds ALTERNATE within each concurrency level -- round 0 runs sync then
+    queue, round 1 runs queue then sync, etc. -- so whatever GPU load drift happens
+    during the run (other sessions, thermal, anything) hits both arms in close temporal
+    proximity instead of one arm entirely before or after the other. Checkpointed under
+    a distinct 'concurrency:interleaved:<mode>:<level>' key namespace so it can never be
+    silently mixed with S6b/S12's separately-timed sync/queue data."""
+    cp_data = cp_data or {}
+    results = {"sync": {}, "queue": {}}
+    with tempfile.TemporaryDirectory(prefix="squire-bench-interleave-") as tmpdir:
+        queue_env = {**ENV, "SQUIRE_QUEUE_DB": os.path.join(tmpdir, "queue.db"),
+                     "SQUIRE_WORKER_HEARTBEAT": os.path.join(tmpdir, "worker.heartbeat"),
+                     "SQUIRE_LEDGER": os.path.join(tmpdir, "ledger.jsonl")}
+        for level in concurrency_levels:
+            sync_key = f"concurrency:interleaved:sync:{level}"
+            queue_key = f"concurrency:interleaved:queue:{level}"
+            sync_recs, queue_recs = cp_data.get(sync_key, []), cp_data.get(queue_key, [])
+            sync_lat = [lat for r in sync_recs for lat in r["rep"]["latencies"]]
+            queue_lat = [lat for r in queue_recs for lat in r["rep"]["latencies"]]
+            queue_fail = sum(r["rep"].get("failures", 0) for r in queue_recs)
+            rounds = max(1, n_per_level // level)
+            done = min(len(sync_recs), len(queue_recs))
+            worker_proc = None
+            try:
+                if done < rounds:
+                    worker_proc = subprocess.Popen([PY, SQUIRE, "worker"], cwd=REPO_ROOT, env=queue_env,
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for _ in range(50):
+                        if os.path.exists(queue_env["SQUIRE_WORKER_HEARTBEAT"]):
+                            break
+                        time.sleep(0.1)
+                for round_i in range(done, rounds):
+                    order = ("sync", "queue") if round_i % 2 == 0 else ("queue", "sync")
+                    round_out = {}
+                    for arm in order:
+                        if arm == "sync":
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=level) as ex:
+                                futs = [ex.submit(run_squire_sum, workload_path) for _ in range(level)]
+                                round_out["sync"] = [r["seconds"] for r in (f.result() for f in futs)
+                                                      if "seconds" in r]
+                        else:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=level) as ex:
+                                futs = [ex.submit(run_squire_queue_sum, workload_path, queue_env)
+                                        for _ in range(level)]
+                                round_results = [f.result() for f in futs]
+                            round_out["queue"] = [r["seconds"] for r in round_results if r.get("state") == "RESULT"]
+                            round_out["queue_failures"] = sum(1 for r in round_results if r.get("state") != "RESULT")
+                    sync_lat.extend(round_out.get("sync", []))
+                    queue_lat.extend(round_out.get("queue", []))
+                    queue_fail += round_out.get("queue_failures", 0)
+                    append_checkpoint(checkpoint_path, {"key": sync_key, "kind": "interleaved_sync",
+                                                         "level": level, "round": round_i,
+                                                         "rep": {"latencies": round_out.get("sync", [])}})
+                    append_checkpoint(checkpoint_path, {"key": queue_key, "kind": "interleaved_queue",
+                                                         "level": level, "round": round_i,
+                                                         "rep": {"latencies": round_out.get("queue", []),
+                                                                 "failures": round_out.get("queue_failures", 0)}})
+            finally:
+                if worker_proc is not None:
+                    worker_proc.terminate()
+                    try:
+                        worker_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        worker_proc.kill()
+                        worker_proc.wait(timeout=10)
+            results["sync"][f"concurrency_{level}"] = {
+                "n": len(sync_lat), "p50": percentile(sync_lat, 0.5), "p95": percentile(sync_lat, 0.95),
+                "raw_latencies": sync_lat,
+            }
+            results["queue"][f"concurrency_{level}"] = {
+                "n": len(queue_lat), "p50": percentile(queue_lat, 0.5), "p95": percentile(queue_lat, 0.95),
+                "failures": queue_fail, "raw_latencies": queue_lat,
+            }
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -444,7 +621,8 @@ def unknown_rate(trials):
 
 
 def aggregate(file_trials, cmd_trials, fidelity_trials, latency_by_concurrency,
-              n_solo, n_conc, checkpoint_path, partial=False, det_trials=None):
+              n_solo, n_conc, checkpoint_path, partial=False, det_trials=None,
+              latency_by_concurrency_queue=None):
     # Relative path only -- an absolute path here would bake this workstation's
     # home directory into a committed results file (scrub_check.py catches this).
     cp_rel = os.path.relpath(checkpoint_path, REPO_ROOT) if checkpoint_path else None
@@ -490,6 +668,10 @@ def aggregate(file_trials, cmd_trials, fidelity_trials, latency_by_concurrency,
     ur = unknown_rate(all_trials)
     results["unknown_rate_pct"] = 100.0 * ur if ur is not None else None
     results["latency_by_concurrency"] = latency_by_concurrency
+    # S12: queue-mode (submit+wait through `squire worker`) latency, same shape as the
+    # sync table above, reported separately -- never blended into one number, same
+    # principle as the file/cmd split in S8c.
+    results["latency_by_concurrency_queue"] = latency_by_concurrency_queue or {}
     return results
 
 
@@ -517,9 +699,15 @@ def print_summary(results):
         print(f"[benchmark] UNKNOWN/fail rate: {results['unknown_rate_pct']:.1f}%")
     for level, v in results["latency_by_concurrency"].items():
         if v["n"]:
-            print(f"[benchmark] {level}: p50={v['p50']:.2f}s p95={v['p95']:.2f}s (n={v['n']})")
+            print(f"[benchmark] sync {level}: p50={v['p50']:.2f}s p95={v['p95']:.2f}s (n={v['n']})")
         else:
-            print(f"[benchmark] {level}: n=0, not yet run")
+            print(f"[benchmark] sync {level}: n=0, not yet run")
+    for level, v in results.get("latency_by_concurrency_queue", {}).items():
+        if v["n"]:
+            print(f"[benchmark] queue {level}: p50={v['p50']:.2f}s p95={v['p95']:.2f}s "
+                  f"(n={v['n']}, failures={v.get('failures', 0)})")
+        else:
+            print(f"[benchmark] queue {level}: n=0, not yet run")
 
 
 def report_mode(checkpoint_path, n_solo, n_conc):
@@ -565,8 +753,19 @@ def report_mode(checkpoint_path, n_solo, n_conc):
             "raw_latencies": latencies,
         }
 
+    latency_by_concurrency_queue = {}
+    for level in [1, 2, 4, 6]:
+        recs = cp_data.get(f"concurrency:queue:{level}", [])
+        latencies = [lat for r in recs for lat in r["rep"]["latencies"]]
+        failures = sum(r["rep"].get("failures", 0) for r in recs)
+        latency_by_concurrency_queue[f"concurrency_{level}"] = {
+            "n": len(latencies), "p50": percentile(latencies, 0.5), "p95": percentile(latencies, 0.95),
+            "failures": failures, "raw_latencies": latencies,
+        }
+
     return aggregate(file_trials, cmd_trials, fidelity_trials, latency_by_concurrency,
-                      n_solo, n_conc, checkpoint_path, partial=True, det_trials=det_trials)
+                      n_solo, n_conc, checkpoint_path, partial=True, det_trials=det_trials,
+                      latency_by_concurrency_queue=latency_by_concurrency_queue)
 
 
 def main():
@@ -580,9 +779,49 @@ def main():
     checkpoint_path = DEFAULT_CHECKPOINT
     if "--checkpoint" in argv:
         checkpoint_path = argv[argv.index("--checkpoint") + 1]
+    # S12: --mode sync|queue|both. Default "sync" is byte-identical to pre-S12 behavior
+    # (only the sync concurrency table runs) -- existing invocations of this script are
+    # unaffected unless --mode is passed explicitly.
+    mode = argv[argv.index("--mode") + 1] if "--mode" in argv else "sync"
+    if mode not in ("sync", "queue", "both", "interleave"):
+        sys.exit(f"usage: --mode sync|queue|both|interleave (got {mode!r})")
 
     n_solo = 10 if quick else 20
     n_conc = 10 if quick else 12
+    # S13: --mode interleave skips the file/cmd/fidelity/det trials entirely (a separate,
+    # focused run to fix the S12 sync-vs-queue A/B fairness gap -- see docs/BENCHMARK.md)
+    # and alternates sync/queue rounds within each concurrency level instead of running
+    # one arm to completion before the other.
+    if mode == "interleave" and not report:
+        levels = [1, 2, 4]
+        n_per_level = max(8, n_conc)
+        cp_data = load_checkpoint(checkpoint_path)
+        conc_target = os.path.join(REPO_ROOT, "squire.py")
+        interleaved = trial_interleaved_latency(conc_target, [2, 4], n_per_level, cp_data, checkpoint_path)
+        # level 1 has no "concurrent" arm to alternate against meaningfully in lockstep,
+        # but is still measured in THIS run (not reused from an older one) for both arms.
+        cp_data = load_checkpoint(checkpoint_path)
+        solo = trial_interleaved_latency(conc_target, [1], n_per_level, cp_data, checkpoint_path)
+        for arm in ("sync", "queue"):
+            interleaved[arm]["concurrency_1"] = solo[arm]["concurrency_1"]
+        results = {"mode": "interleave", "n_per_level": n_per_level, "levels": levels,
+                   "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                   "checkpoint_path": os.path.relpath(checkpoint_path, REPO_ROOT),
+                   "interleaved_latency": interleaved}
+        if json_mode:
+            print(json.dumps(results, indent=2))
+        else:
+            for level in levels:
+                s, q = interleaved["sync"][f"concurrency_{level}"], interleaved["queue"][f"concurrency_{level}"]
+                print(f"concurrency={level}  sync n={s['n']} p50={s['p50']} p95={s['p95']}  "
+                      f"queue n={q['n']} p50={q['p50']} p95={q['p95']} failures={q.get('failures', 0)}")
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            fname = os.path.join(out_dir, f"benchmark-interleave-{time.strftime('%Y%m%d-%H%M%S')}.json")
+            with open(fname, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"[benchmark] raw results written to {fname}", file=sys.stderr)
+        return 0
 
     if report:
         results = report_mode(checkpoint_path, n_solo, n_conc)
@@ -602,11 +841,20 @@ def main():
         # just appended above (harmless -- different key namespace) and any prior
         # concurrency rounds from an earlier killed run.
         cp_data = load_checkpoint(checkpoint_path)
-        latency_by_concurrency = trial_concurrent_latency(
-            conc_target, [2, 4, 6], n_conc, cp_data, checkpoint_path)
+        latency_by_concurrency = {}
+        if mode in ("sync", "both"):
+            latency_by_concurrency = trial_concurrent_latency(
+                conc_target, [2, 4, 6], n_conc, cp_data, checkpoint_path)
+            cp_data = load_checkpoint(checkpoint_path)
+        latency_by_concurrency_queue = {}
+        if mode in ("queue", "both"):
+            latency_by_concurrency_queue = trial_concurrent_latency_queue(
+                conc_target, [2, 4, 6], n_conc, cp_data, checkpoint_path)
         results = aggregate(file_trials, cmd_trials, fidelity_trials, latency_by_concurrency,
-                             n_solo, n_conc, checkpoint_path, partial=False, det_trials=det_trials)
+                             n_solo, n_conc, checkpoint_path, partial=False, det_trials=det_trials,
+                             latency_by_concurrency_queue=latency_by_concurrency_queue)
         results["resumed_from_existing_checkpoint"] = resumed
+        results["mode"] = mode
 
     if json_mode:
         print(json.dumps(results, indent=2))

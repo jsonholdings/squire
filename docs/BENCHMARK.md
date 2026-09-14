@@ -334,6 +334,99 @@ existing `data/benchmark-checkpoint.jsonl` (no new model calls); the file/cmd sp
 CIs above were computed directly from that JSON's `file_trials`/`cmd_trials`/
 `deterministic_cmd_trials` reps.
 
+## S12 update (2026-09-13) — sync vs queue measured, heartbeat bug found and fixed, GATE: no guidance change
+
+**Goal:** does `squire submit`+`squire worker` (the job queue, v0.2.9+) beat direct synchronous
+`squire sum` under 2/4/6 concurrent agent load? `scripts/benchmark.py` gained a `--mode
+sync|queue|both` flag (default `sync`, byte-identical to pre-S12 behavior); queue mode runs
+one foreground `squire worker` per concurrency level against an isolated `SQUIRE_QUEUE_DB`/
+heartbeat/ledger (a per-run temp dir, never the real `~/.squire/queue.db`), timing each
+request end-to-end as `squire submit` + `squire wait --timeout`, the way an agent actually
+uses the queue. The shared `~/.squire/llm.lock` is deliberately LEFT at its real default (not
+isolated) so lock contention is measured identically to how the sync path already measures it
+-- removing that contention is exactly what the queue is supposed to do, if it does.
+
+**Bug found and fixed first (`squire.py:cmd_worker`): heartbeat went stale during normal,
+successful jobs.** The very first real run showed 34/34 queue requests reported `UNKNOWN
+(no worker heartbeat)` by `squire wait`, at every concurrency level, despite the worker
+process being alive and correctly finishing jobs. Root cause, verified live: the heartbeat
+was written once per loop iteration, BEFORE claiming a job, so a job whose model call ran
+longer than `HEARTBEAT_STALE_S` (default 15s) let the heartbeat go stale WHILE the worker
+was actively working. This benchmark's own solo latency table shows 14b calls routinely
+take 12-70s (well past 15s) even before S12, so this was a near-certain false UNKNOWN on any
+real job, not an edge case. **Fix:** `cmd_worker` now runs a background daemon thread that
+refreshes the heartbeat on a fixed cadence (`HEARTBEAT_STALE_S / 3`) independent of job
+duration, so staleness now only means the worker process is actually gone or hung.
+Reproduced pre-fix (debug harness, direct call): `squire sum squire.py` through the queue
+returned `state: UNKNOWN` at `seconds: 16.18`. Post-fix, the same call: `state: RESULT` at
+`seconds: 20.19`. Existing suite unaffected: `python3.13 -m pytest -q` → **120 passed**
+(verified this session, `squire run --`). No existing test exercised a job running past the
+old 15s window, so nothing masked this before.
+
+**SUPERSEDED by S13 below.** The table that stood here compared sync numbers from an
+*earlier, separate* checkpoint run (S6b) against queue numbers measured in this S12 session
+-- not the same session, not the same load, not a fair A/B. S13 re-measured both arms
+interleaved (alternating sync/queue rounds within one run) to close that gap; see the S13
+section for the real comparison and the numbers that back the recommendation below.
+
+**Recommendation: NO guidance change** (confirmed, not merely carried over, by S13's fair
+A/B). `squire sum`/`ask`/`draft`/etc. remain the right DEFAULT for an agent that needs an
+answer inline; `submit`+`wait`/`status` stays the right choice specifically when an agent
+wants to submit work and either poll later or hand it to a separate `squire worker`
+service, not because it is faster. `squire/CLAUDE.md` and `worker.md` guidance is unchanged
+by this result; no proposal is queued for either, since there is no case to make.
+
+**Limitations:** other sessions' real squire use may have added load during this run (the
+stated confound applies here too); the isolated QUEUE_DB means this measures ONE worker
+processing ONE benchmark's jobs, not queue behavior under a real shared production worker
+serving multiple sessions at once, which would need a separate, riskier test against the
+real `~/.squire/queue.db`. Reproduce: `python3.13 scripts/benchmark.py --mode queue --quick
+--json --checkpoint data/benchmark-checkpoint.jsonl` (resumable); sync numbers unchanged
+from S7/S8b, reproduce with `--mode sync` (the default) or `--report`.
+
+## S13 update (2026-09-13) — sync vs queue re-measured INTERLEAVED (fair A/B)
+
+**Gap closed:** S12's table above compared sync p50/p95 at concurrency 1/2 (12.11s/23.87s,
+17.75s/25.14s) against numbers that turned out to be byte-identical to an EARLIER S6b run --
+sync and queue were never measured in the same session or under the same load, so the
+comparison was not a fair A/B. `scripts/benchmark.py` gained `--mode interleave`, which
+alternates sync and queue rounds within each concurrency level (round 0: sync then queue;
+round 1: queue then sync; ...) against the same `squire.py` workload, isolated
+`SQUIRE_QUEUE_DB`/heartbeat/ledger, real `~/.squire/llm.lock` contention (same as S12), so
+whatever GPU load drift happens during the run hits both arms at close to the same time
+instead of one arm entirely before or after the other.
+
+**Interleaved latency, `n=12` per cell, this session, both arms same run, bootstrap 95% CI
+on p50 (`bootstrap_ci`, seed 1234, 2000 resamples):**
+
+| Level | Sync p50 (95% CI) | Sync p95 | Queue p50 (95% CI) | Queue p95 | Queue failures |
+|---|---|---|---|---|---|
+| 1 (solo) | 12.81s [12.26, 13.76] | 13.82s | 13.69s [13.21, 14.24] | 14.73s | 0 |
+| 2 | 21.89s [13.02, 26.12] | 30.72s | 19.46s [13.74, 26.52] | 27.48s | 0 |
+| 4 | 37.93s [24.99, 51.50] | 59.77s | 33.04s [20.77, 45.79] | 54.02s | 0 |
+
+Load stated honestly: this workstation's single shared RTX 3090/qwen2.5:14b, this script's
+own concurrent calls only -- other sessions may have added real load during the ~16-minute
+run (11:31-11:47 EDT), same confound as every other latency table in this doc.
+
+**Reading the numbers:** the 95% CIs overlap at every level -- level 1's CIs [12.26,13.76]
+vs [13.21,14.24] overlap narrowly with queue's point estimate nominally slower; levels 2 and
+4 overlap widely with queue's point estimate nominally faster on p50 and p95 both times. No
+level shows a CI-separated winner. This is the same substantive conclusion S12 reached
+(mixed, no clean win), now backed by a same-session, same-load, alternating-round
+measurement instead of two runs stitched together after the fact.
+
+**Recommendation: NO guidance change**, now on solid footing. `squire sum`/`ask`/`draft`/
+etc. remain the right DEFAULT for an agent that needs an answer inline; `submit`+`wait`/
+`status` stays the right choice when an agent wants to submit work and poll later or hand
+it to a separate `squire worker` service, not because it is faster. `squire/CLAUDE.md` and
+`worker.md` guidance is unchanged.
+
+**Reproduce:** `python3 scripts/benchmark.py --mode interleave --checkpoint
+data/benchmark-checkpoint-s13.jsonl --json`. Raw checkpoint keyed under
+`concurrency:interleaved:{sync,queue}:{level}`, distinct from S6b/S12's separately-timed
+keys so the two can never be silently mixed.
+
 **Limitations, stated plainly:**
 - The deterministic corpus proves exit-code *passthrough* is reliable; it does not by itself
   prove summary *quality* under load — that is `failing_name_recall` (fidelity cases, still

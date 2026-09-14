@@ -1,9 +1,16 @@
 """Safety controls for Squire. None of these need a running model."""
+import fcntl
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+import pytest
 
 SQUIRE = Path(__file__).resolve().parents[1] / "squire.py"
 # A dedicated lock file, never the real ~/.squire/llm.lock. Without this, every test process in
@@ -162,6 +169,113 @@ def test_redact_removes_secret_shapes_and_keeps_context():
     assert "password = [REDACTED]" in out and out.count("[REDACTED]") >= 5
 
 
+def test_llm_returns_unknown_when_gpu_paused(monkeypatch, tmp_path):
+    flag = tmp_path / "gpu-paused.json"
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": os.getpid()}))
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("llm() must not call the network while GPU-paused")
+    monkeypatch.setattr(sq, "_post", fail_if_called)
+
+    out = sq.llm("hello")
+    assert out.startswith("UNKNOWN") and "ncp-archpreview" in out
+
+
+def test_embed_raises_when_gpu_paused(monkeypatch, tmp_path):
+    flag = tmp_path / "gpu-paused.json"
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": os.getpid()}))
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+    monkeypatch.setattr(sq, "_post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
+    with pytest.raises(sq.BackendError, match="ncp-archpreview"):
+        sq.embed(["text"])
+
+
+def test_gpu_paused_by_ignores_stale_pid(monkeypatch, tmp_path):
+    # Control: a pid that cannot possibly be alive must be treated as unpaused, AND the stale
+    # flag file must be cleaned up -- proves the check can return both "paused" and "not paused".
+    flag = tmp_path / "gpu-paused.json"
+    dead_pid = 999999
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": dead_pid}))
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+    assert sq.gpu_paused_by() is None
+    assert not flag.exists()
+
+    # control: a live pid (our own) is correctly reported as still paused
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": os.getpid()}))
+    assert sq.gpu_paused_by() == "ncp-archpreview"
+
+
+def test_gpu_pause_does_not_block_calls_to_the_paused_owners_own_api(monkeypatch, tmp_path):
+    # When Squire is benchmarked WITH NCP-ArchPreview as its backend, the pause flag NCP wrote
+    # for itself must not block Squire's own calls to that same server -- the pause exists to
+    # keep Ollama off the GPU, not to block talking to the paused owner directly.
+    flag = tmp_path / "gpu-paused.json"
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": os.getpid(),
+                                 "api_base": "http://127.0.0.1:8790/v1"}))
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+    monkeypatch.setattr(sq, "BACKEND", "openai")
+    monkeypatch.setattr(sq, "OPENAI_BASE", "http://127.0.0.1:8790/v1")
+    assert sq.gpu_paused_by() is None
+
+    called = {}
+
+    def fake_post(url, payload, timeout=300):
+        called["url"] = url
+        return {"choices": [{"message": {"content": "real answer"}}]}
+    monkeypatch.setattr(sq, "_post", fake_post)
+    assert sq.llm("hello") == "real answer"
+    assert called["url"].startswith("http://127.0.0.1:8790/v1")
+
+
+def test_gpu_pause_still_blocks_openai_backend_pointed_elsewhere(monkeypatch, tmp_path):
+    # Control for the test above: an "openai" backend pointed at a DIFFERENT server than the
+    # paused owner's own api_base must still be blocked -- proves the check isn't just "backend
+    # is openai, always allow".
+    flag = tmp_path / "gpu-paused.json"
+    flag.write_text(json.dumps({"owner": "ncp-archpreview", "pid": os.getpid(),
+                                 "api_base": "http://127.0.0.1:8790/v1"}))
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+    monkeypatch.setattr(sq, "BACKEND", "openai")
+    monkeypatch.setattr(sq, "OPENAI_BASE", "http://127.0.0.1:9999/v1")
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("must not call an unrelated openai backend while GPU-paused")
+    monkeypatch.setattr(sq, "_post", fail_if_called)
+
+    out = sq.llm("hello")
+    assert out.startswith("UNKNOWN") and "ncp-archpreview" in out
+
+
+def test_pid_alive_falls_back_to_flatpak_spawn_host(monkeypatch):
+    # A container's docker-reported pid lives in the HOST pid namespace and is invisible to a
+    # plain os.kill from inside Claude Code's sandboxed Bash tool (found 2026-09-13: a running
+    # container's pid raised ProcessLookupError). _pid_alive must fall back to
+    # `flatpak-spawn --host kill -0` rather than declaring it stale.
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+    monkeypatch.setattr(sq.os, "kill", fake_kill)
+
+    calls = []
+
+    class FakeResult:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return FakeResult()
+    monkeypatch.setattr(sq.subprocess, "run", fake_run)
+
+    assert sq._docker_pid_alive(12345) is True
+    assert calls and calls[0][:3] == ["flatpak-spawn", "--host", "kill"]
+
+    # control: the host-escape path also correctly reports a truly dead pid
+    class FakeDeadResult:
+        returncode = 1
+    monkeypatch.setattr(sq.subprocess, "run", lambda cmd, **k: FakeDeadResult())
+    assert sq._docker_pid_alive(12345) is False
+
+
 def test_remote_backend_is_refused_unless_allowed(monkeypatch):
     import pytest
     with pytest.raises(sq.BackendError):
@@ -235,6 +349,137 @@ def test_grep_backend_failure_still_logs_a_ledger_row(tmp_path):
     assert grep_rows[0]["gen_s"] is not None and grep_rows[0]["gen_s"] >= 0
 
 
+# ---------------------------------------------------------------- S11: grep lock/timeout fixes
+
+class _FakeOllama(BaseHTTPRequestHandler):
+    """Minimal /api/embed + /api/generate stand-in so grep's --timeout and lock-separation
+    behavior can be tested without a real model. `delay_s` (class attr, set per test) simulates
+    a slow/stuck backend call -- the real-world failure mode found in the ledger (S11: two
+    real grep calls tonight logged status=timeout, gen_s=600.1, proving the embed HTTP call
+    itself hung for the full old 600s timeout, not just a lock queue)."""
+    delay_s = 0.0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        time.sleep(self.delay_s)
+        if self.path == "/api/embed":
+            n = len(body.get("input", []))
+            data = json.dumps({"embeddings": [[1.0, 0.0] for _ in range(n)]}).encode()
+        else:
+            data = json.dumps({"response": "ok"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture
+def fake_ollama():
+    _FakeOllama.delay_s = 0.0
+    server = HTTPServer(("127.0.0.1", 0), _FakeOllama)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}", _FakeOllama
+    server.shutdown()
+    t.join(timeout=5)
+
+
+def test_embed_and_chat_use_separate_lock_files_by_default():
+    # S11: embed() used to share LLM_LOCK_PATH with llm() (chat generation). A single slow embed
+    # call holding that ONE lock for its whole HTTP timeout blocked every other squire call on
+    # the workstation (run/sum/ask/diff/grep) for as long as the embed call took. Control: prove
+    # the two constants really differ (a no-op fix would leave them equal and this would catch it).
+    assert sq.EMBED_LOCK_PATH != sq.LLM_LOCK_PATH
+
+
+def test_embed_does_not_block_behind_a_held_chat_lock(tmp_path, fake_ollama):
+    base, handler = fake_ollama
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    llm_lock = str(lock_dir / "llm.lock")
+    embed_lock = str(lock_dir / "embed.lock")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": llm_lock,
+           "SQUIRE_EMBED_LOCK": embed_lock, "SQUIRE_LLM_LOCK_TIMEOUT": "5"}
+    # Hold the CHAT lock from this test process for longer than embed should ever need to wait.
+    held = open(llm_lock, "a+")
+    os.makedirs(os.path.dirname(llm_lock), exist_ok=True)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        (tmp_path / "a.py").write_text("def frobulate_widget():\n    pass\n")
+        t0 = time.monotonic()
+        p = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(tmp_path)],
+                           text=True, capture_output=True, env=env, timeout=30)
+        elapsed = time.monotonic() - t0
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+    # Before the fix this would have queued behind the held chat lock for LLM_LOCK_TIMEOUT (5s
+    # here); with a separate embed lock it completes almost immediately regardless.
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert elapsed < 4, f"embed waited on the chat lock: {elapsed}s"
+
+
+def test_grep_timeout_returns_partial_hits_not_nothing(tmp_path, fake_ollama):
+    base, handler = fake_ollama
+    handler.delay_s = 0.3  # each /api/embed call (one per GREP_BATCH-sized batch) takes 0.3s
+    # 70 single-window files = 70 chunks = 3 batches at GREP_BATCH=32 (32, 32, 6). With a 0.5s
+    # deadline: batch 1 (elapsed 0<0.5) and batch 2 (elapsed ~0.3<0.5) run; the elapsed-~0.6s
+    # check before batch 3 trips the deadline, so it's skipped -- exercising the mid-run break.
+    for i in range(70):
+        (tmp_path / f"f{i}.py").write_text(f"def frobulate_widget_{i}():\n    pass\n")
+    ledger = tmp_path / "l.jsonl"
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock"), "SQUIRE_LEDGER": str(ledger)}
+    p = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(tmp_path),
+                       "--timeout", "0.5", "--json"], text=True, capture_output=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stdout + p.stderr
+    obj = json.loads(p.stdout)
+    assert obj["partial"] is True
+    assert obj["results"] != []  # control: a timeout that returns NOTHING would defeat the point
+    rows = [json.loads(l) for l in ledger.read_text().splitlines() if json.loads(l)["cmd"] == "grep"]
+    assert rows[-1]["status"] == "partial"
+
+
+def test_grep_no_timeout_still_returns_full_results_control(tmp_path, fake_ollama):
+    # Control for the test above: WITHOUT --timeout, the same repo/backend finishes normally and
+    # is NOT marked partial -- proves partial=True above is caused by the deadline, not a bug.
+    base, handler = fake_ollama
+    handler.delay_s = 0.05
+    (tmp_path / "a.py").write_text("def frobulate_widget():\n    pass\n")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock")}
+    p = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(tmp_path), "--json"],
+                       text=True, capture_output=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stdout + p.stderr
+    obj = json.loads(p.stdout)
+    assert obj["partial"] is False
+    assert len(obj["results"]) == 1
+
+
+def test_grep_cache_hit_skips_reembedding_control(tmp_path, fake_ollama):
+    # Control proving the persistent per-tree cache (keyed mtime+size) actually works: a second
+    # grep over an UNCHANGED file re-embeds 0 chunks (warm), vs the first (cold) run re-embedding
+    # some. Without a working cache both runs would re-embed the same count.
+    base, handler = fake_ollama
+    handler.delay_s = 0.0
+    (tmp_path / "a.py").write_text("def frobulate_widget():\n    pass\n")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock")}
+    cold = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(tmp_path), "--json"],
+                          text=True, capture_output=True, env=env, timeout=30)
+    warm = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(tmp_path), "--json"],
+                          text=True, capture_output=True, env=env, timeout=30)
+    cold_obj, warm_obj = json.loads(cold.stdout), json.loads(warm.stdout)
+    assert cold_obj["reembedded_chunks"] > 0
+    assert warm_obj["reembedded_chunks"] == 0
+
+
 def test_doctor_backend_down_exits_2():
     p = run("doctor", "--json")
     import json as _j
@@ -264,6 +509,69 @@ def test_ledger_rows_tagged_with_source_from_conftest(tmp_path):
     run("sum", "-", stdin="x\n", env=env)
     import json as _j
     assert _j.loads(ledger.read_text().splitlines()[0])["source"] == "test"
+
+
+# ---- S14: run ledger rows carried exit=None; verify-check compared against a truncated tail ----
+
+def test_ledger_records_run_exit_code_and_duration(tmp_path):
+    # S14: found live -- the 5 latest `run` ledger rows all carried exit=None even though
+    # `squire run` prints the real code (`[squire] exit=N`) to the user. Control: exit=3 (not 0
+    # and not None) proves the real subprocess code reached the ledger, not a hardcoded default.
+    code = "import sys\nfor i in range(200): print('line', i)\nsys.exit(3)"
+    ledger = tmp_path / "l.jsonl"
+    env = {**DOWN, "SQUIRE_LEDGER": str(ledger)}
+    p = run("run", "--", sys.executable, "-c", code, env=env)
+    assert p.returncode == 3
+    rows = [json.loads(l) for l in ledger.read_text().splitlines() if json.loads(l)["cmd"] == "run"]
+    assert len(rows) == 1
+    assert rows[0]["exit_code"] == 3
+    assert rows[0]["duration_s"] is not None and rows[0]["duration_s"] >= 0
+
+
+def test_condense_verified_checks_against_full_notes_not_tail_slice(monkeypatch):
+    # S14: found live -- a passing 5,604-line smoke-test log got a summary whose last line was
+    # off-topic: "JSONDecodeError is not mentioned in the source." Root cause: the verify check
+    # compared the final summary against text[-CHUNK:], only the LAST chunk of a multi-chunk
+    # input. A true claim drawn from an EARLIER chunk then looks like a hallucination purely
+    # because the verifier's window never saw it. Reproduced here: the fact lives ONLY in chunk
+    # 1's note; a fake model's check() replies "OK" only if that fact is literally present in the
+    # SOURCE text it was handed.
+    monkeypatch.setattr(sq, "CHUNK", 200)  # forces 2 chunks below without truncating the notes
+
+    def fake_llm(prompt, max_tokens=300):
+        if "part 1/2" in prompt:
+            return "chunk 1 handled a JSONDecodeError safely"
+        if "part 2/2" in prompt:
+            return "chunk 2: all tests passed"
+        if "Combine these partial notes" in prompt:
+            return "All tests passed; one JSONDecodeError was handled safely."
+        if "SOURCE (truncated)" in prompt:
+            source = prompt.split("SOURCE:\n", 1)[1].split("\n\nSUMMARY:")[0]
+            return "OK" if "JSONDecodeError" in source else "JSONDecodeError is not mentioned in the source."
+        raise AssertionError(f"unexpected prompt: {prompt!r}")
+
+    monkeypatch.setattr(sq, "llm", fake_llm)
+    text = "A" * 200 + "B" * 200  # > CHUNK(200) -> exactly 2 chunks
+    summary, flag = sq.condense_verified(text, "Summarize this")
+    assert "JSONDecodeError" in summary
+    # Control: before the fix, check_source was text[-CHUNK:] = the "B"*200 chunk alone, which
+    # never mentions JSONDecodeError -- that would have set flag to the false-positive sentence.
+    assert flag is None
+
+
+def test_condense_verified_single_chunk_checks_raw_text_control(monkeypatch):
+    # Control for the test above: a single-chunk input (fits in one CHUNK, no notes produced)
+    # must still be checked against the raw text itself -- proves the S14 fix only changes
+    # behavior on the multi-chunk path, not the common short-input case.
+    def fake_llm(prompt, max_tokens=300):
+        if "SOURCE (truncated)" in prompt:
+            source = prompt.split("SOURCE:\n", 1)[1].split("\n\nSUMMARY:")[0]
+            return "OK" if "hello" in source else "not mentioned"
+        return "a summary mentioning hello"
+
+    monkeypatch.setattr(sq, "llm", fake_llm)
+    summary, flag = sq.condense_verified("hello world", "Summarize this")
+    assert flag is None
 
 
 def test_stats_excludes_source_test_rows_but_keeps_them_in_the_file(tmp_path):
