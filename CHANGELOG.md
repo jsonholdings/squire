@@ -4,6 +4,15 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-09-15
+### Added
+- **Model bake-off note** (`docs/MODEL-BAKEOFF-2026-09-15.md`): ran `eval/run_eval.py` against
+  `qwen3:14b`, `gemma3:12b` and `mistral-small:24b` as candidates to replace the default
+  `qwen2.5:14b` on this workstation's RTX 3090. No candidate cleared the bar (≥ baseline recall,
+  better speed or VRAM) — `qwen3:14b`'s default tag scored clearly worse (thinking-mode preamble
+  crowds out extractable names), `gemma3:12b`/`mistral-small:24b` matched recall but were slower
+  and no lighter. Default `SQUIRE_MODEL` and `AUTO_TIERS` are unchanged.
+
 ## [0.2.19] - 2026-09-15
 ### Added
 - **Every public squire number is now generated, never hand-typed.** `scripts/squire_report.py` gained

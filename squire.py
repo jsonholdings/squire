@@ -31,7 +31,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.19"
+__version__ = "0.2.20"
 
 import datetime as _dt
 import fcntl
