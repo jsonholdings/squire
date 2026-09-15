@@ -36,7 +36,7 @@ It is deliberately boring: real exit codes are never hidden, model output is nev
 fact, and a down backend fails loud (`UNKNOWN`) instead of silently passing raw text through as if
 it had been checked.
 
-**Status: v0.2.5, pre-release.** Every command in `squire --help` is implemented: `run`, `sum`,
+**Status: v0.2.17.** Every command in `squire --help` is implemented: `run`, `sum`,
 `ask`, `draft`, `diff`, `grep`, `triage`, `stats`, `doctor`, `--json`, `--version`. Pluggable
 backends (`SQUIRE_BACKEND=ollama|openai`), `SQUIRE_MODEL=auto`, `SQUIRE_ALLOW_HOSTS`, and secret
 redaction are also implemented (`squire.py`, verified via `squire --help` and `redact()`). Docker

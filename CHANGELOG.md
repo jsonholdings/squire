@@ -3,6 +3,13 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.2.17] - 2026-09-15
+### Changed
+- **README and docs/SAVINGS.md figures** are current (195 sessions, 26,000:1 cache-read to uncached input,
+  99.7% of characters kept out of context across 1,007 calls, ~70.6M tokens estimated). The per-session
+  cache-read "avoided" estimate is no longer reported because it exceeds the cache reads actually measured.
+
 ### Fixed
 - **`scripts/sync_to_mirror.py --apply`** no longer hardcodes `python3.13` for the mirror's test run: it uses
   `$SQUIRE_TEST_PYTHON`, defaulting to the running interpreter, so the weekly refresh works on a host without python3.13.
