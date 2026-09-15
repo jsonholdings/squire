@@ -31,7 +31,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.20"
+__version__ = "0.2.21"
 
 import datetime as _dt
 import fcntl
@@ -53,6 +53,13 @@ MODEL = os.environ.get("SQUIRE_MODEL", "qwen2.5:14b")
 EMBED_MODEL = os.environ.get("SQUIRE_EMBED_MODEL", "nomic-embed-text")
 CTX = int(os.environ.get("SQUIRE_CTX", "16384"))    # Ollama defaults to 2048, which truncates silently
 KEEP_ALIVE = os.environ.get("SQUIRE_KEEP_ALIVE", "2h")
+# Some hybrid-reasoning models (e.g. qwen3) default to emitting a "thinking" preamble that can
+# crowd out the actual answer under squire's short max_tokens budget. Ollama's generate/chat API
+# accepts a top-level "think" bool to disable it (https://ollama.com/blog/thinking, "Turning
+# thinking on/off" -- also exposed via /api/generate's "think" field, verified live 2026-09-15
+# against qwen3:14b). SQUIRE_THINK unset means "don't send the field" (model's own default).
+_THINK_ENV = os.environ.get("SQUIRE_THINK")
+THINK = None if _THINK_ENV is None else _THINK_ENV.strip().lower() not in ("0", "false", "no")
 CHUNK = 24000            # chars per chunk (~6k tokens), leaves room for prompt + answer
 SHORT = 60               # lines at or below this are shown raw, no model call
 TAIL = 25
@@ -382,9 +389,12 @@ def llm(prompt, max_tokens=300):
                 return data["choices"][0]["message"]["content"].strip()
             # keep_alive holds the model in VRAM between calls: a cold load (~75s for 14B) inside a
             # hook-wrapped test run can push the command past the caller's timeout.
-            data = _post(HOST + "/api/generate", {"model": model(), "prompt": prompt, "stream": False,
-                         "keep_alive": KEEP_ALIVE,
-                         "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}})
+            gen_payload = {"model": model(), "prompt": prompt, "stream": False,
+                           "keep_alive": KEEP_ALIVE,
+                           "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}}
+            if THINK is not None:
+                gen_payload["think"] = THINK
+            data = _post(HOST + "/api/generate", gen_payload)
             return data.get("response", "").strip()
         except Exception as e:  # noqa: BLE001 - any failure is reported, never swallowed
             return f"UNKNOWN: local model unavailable ({type(e).__name__}: {e})"[:300]

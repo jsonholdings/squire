@@ -4,6 +4,19 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-09-15
+### Added
+- `SQUIRE_THINK` env var: when set, adds Ollama's `think` field to `/api/generate` calls
+  (`true`/`false`), letting a hybrid-reasoning model like `qwen3:14b` run in non-thinking mode.
+  Unset by default, so existing behavior for every model is unchanged.
+
+### Changed
+- Model bake-off decision (docs/MODEL-BAKEOFF-2026-09-15.md, section 2): default stays
+  `qwen2.5:14b`. Re-run on the full fidelity corpus (n=50, 3 passes) confirmed `qwen3:14b` in
+  non-thinking mode recovers full recall and ties the default on latency/VRAM, but a tie does
+  not clear the bar to switch. `gemma3:12b`/`mistral-small:24b` remain slower with no recall
+  gain. No candidate wins outright.
+
 ## [0.2.20] - 2026-09-15
 ### Added
 - **Model bake-off note** (`docs/MODEL-BAKEOFF-2026-09-15.md`): ran `eval/run_eval.py` against

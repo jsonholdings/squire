@@ -228,6 +228,35 @@ def test_gpu_pause_does_not_block_calls_to_the_paused_owners_own_api(monkeypatch
     assert called["url"].startswith("http://127.0.0.1:8790/v1")
 
 
+def test_llm_think_field_only_sent_when_squire_think_set(monkeypatch, tmp_path):
+    # SQUIRE_THINK is unset by default: the "think" field must be absent from the payload so a
+    # model's own default behavior is unchanged for every existing caller. Setting SQUIRE_THINK
+    # to a falsy value (used for qwen3's non-thinking mode in the 2026-09-15 model bake-off) must
+    # add "think": False; setting it truthy must add "think": True.
+    flag = tmp_path / "gpu-paused.json"  # doesn't exist -- not paused
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+    monkeypatch.setattr(sq, "BACKEND", "ollama")
+
+    captured = {}
+
+    def fake_post(url, payload, timeout=300):
+        captured["payload"] = payload
+        return {"response": "ok"}
+    monkeypatch.setattr(sq, "_post", fake_post)
+
+    monkeypatch.setattr(sq, "THINK", None)
+    sq.llm("hello")
+    assert "think" not in captured["payload"]
+
+    monkeypatch.setattr(sq, "THINK", False)
+    sq.llm("hello")
+    assert captured["payload"]["think"] is False
+
+    monkeypatch.setattr(sq, "THINK", True)
+    sq.llm("hello")
+    assert captured["payload"]["think"] is True
+
+
 def test_gpu_pause_still_blocks_openai_backend_pointed_elsewhere(monkeypatch, tmp_path):
     # Control for the test above: an "openai" backend pointed at a DIFFERENT server than the
     # paused owner's own api_base must still be blocked -- proves the check isn't just "backend
