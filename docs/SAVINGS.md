@@ -28,13 +28,10 @@ Two independently-labelled layers, computed by [`scripts/squire_report.py`](../s
    character count sent in and returned. `chars_saved = chars_in - chars_out` is itself
    a measured byte count — condensation genuinely happened. Converting that to a token
    estimate (`chars_saved / 4`, the standard rough heuristic, not an actual tokenizer)
-   and then multiplying by how many turns remained in that call's own session at or
-   after it ran gives an estimate of the cache-read cost avoided — because that avoided
-   text would otherwise have sat in context, re-billed, for every one of those turns.
-   **Per call, this is an upper bound**: it assumes the avoided text would otherwise
-   have stayed in context verbatim for every remaining turn, with no compaction. **Across
-   all usage, it is incomplete**: it covers only the calls that could be tied to a session
-   (see below), so it says nothing about the rest.
+   gives the one-time estimate reported below. The script also multiplies each call's
+   saving by the turns remaining in its session (`cache_read_avoided_ESTIMATE`), but that
+   figure is not reported: it assumes no compaction and counts overlapping calls
+   repeatedly, and at the current ledger size it exceeds the cache reads actually measured.
 
 ## The numbers
 
