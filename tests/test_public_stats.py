@@ -122,7 +122,7 @@ def test_cli_public_defaults_to_owner_cutoff_and_excludes_earlier_rows():
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert p.returncode == 0, p.stdout
         assert "999" not in p.stdout
-        assert "1 real call logged" in p.stdout
+        assert "1 model-backed call logged" in p.stdout
 
 
 def test_cli_check_exits_nonzero_when_stale():

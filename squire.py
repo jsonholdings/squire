@@ -31,7 +31,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.17"
+__version__ = "0.2.18"
 
 import datetime as _dt
 import fcntl
@@ -146,7 +146,7 @@ def check_local(url):
 
 
 def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None, source=None, job=None,
-             status=None, exit_code=None, duration_s=None):
+             status=None, exit_code=None, duration_s=None, passthrough=False):
     # chars_in/out/ts are real, computed facts. The token estimate derived from them in `stats`
     # is NOT -- the two must never be presented as the same kind of claim.
     # queue_wait_s/gen_s (2026-09-13, S1) split how long a call sat waiting for the local lock
@@ -166,6 +166,10 @@ def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None
            "backend_ok": backend_ok, "queue_wait_s": queue_wait_s, "gen_s": gen_s,
            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "source": source or SOURCE,
            "status": status, "exit_code": exit_code, "duration_s": duration_s}
+    # `passthrough` (2026-09-15): a short `squire run` shown raw with no model call. Logged so real
+    # usage is counted; it saved nothing, so every savings total excludes it.
+    if passthrough:
+        row["passthrough"] = True
     if job:
         row.update(job_id=job["id"], enqueued_at=job["enqueued_at"], started_at=job["started_at"],
                    finished_at=job["finished_at"])
@@ -549,6 +553,8 @@ def cmd_run(argv):
     if not json_mode:
         print(f"[squire] exit={p.returncode} lines={len(lines)}")
     if len(lines) <= SHORT:
+        log_call("run", len(out), len(out), True, exit_code=p.returncode,
+                 duration_s=round(time.monotonic() - run_start, 2), passthrough=True)
         emit("run", p.returncode, out, None, True, json_mode)
     else:
         if not json_mode:
@@ -1202,6 +1208,10 @@ def cmd_stats(argv):
         excluded_test = len(all_rows) - len(rows)
     else:
         excluded_test = 0
+    # Short `squire run` passthroughs are logged so usage is counted, but they saved nothing, so they
+    # are reported as a separate count and kept out of every savings total below.
+    passthrough_calls = sum(1 for r in rows if r.get("passthrough"))
+    rows = [r for r in rows if not r.get("passthrough")]
     total_in = sum(r["chars_in"] for r in rows)
     total_out = sum(r["chars_out"] for r in rows)
     ok = sum(1 for r in rows if r["backend_ok"])
@@ -1213,7 +1223,8 @@ def cmd_stats(argv):
         c["chars_out"] += r["chars_out"]
     est = (total_in - total_out) // CHARS_PER_TOKEN
     if json_mode:
-        print(json.dumps({"cmd": "stats", "ledger": LEDGER, "calls": len(rows), "backend_ok_calls": ok,
+        print(json.dumps({"cmd": "stats", "ledger": LEDGER, "calls": len(rows),
+                          "passthrough_calls": passthrough_calls, "backend_ok_calls": ok,
                           "chars_in": total_in, "chars_out": total_out, "chars_saved": total_in - total_out,
                           "by_cmd": by_cmd, "estimated_tokens_saved": est, "excluded_test_rows": excluded_test,
                           "estimate_method": f"chars/{CHARS_PER_TOKEN}, per-read only; not a measured token count"}))
@@ -1222,7 +1233,8 @@ def cmd_stats(argv):
         print(f"[squire] no ledger entries yet -- run some commands first"
               + (f" ({excluded_test} test rows excluded)" if excluded_test else ""))
         return
-    print(f"[squire] {len(rows)} calls logged ({ok} backend-ok, {len(rows) - ok} UNKNOWN) -- REAL, computed from {LEDGER}"
+    print(f"[squire] {len(rows)} model-backed calls logged ({ok} backend-ok, {len(rows) - ok} UNKNOWN), plus "
+          f"{passthrough_calls} short passthrough runs -- REAL, computed from {LEDGER}"
           + (f" ({excluded_test} test rows excluded, not deleted)" if excluded_test else ""))
     for name, c in sorted(by_cmd.items()):
         print(f"  {name:7} calls={c['calls']:<5} chars in={c['chars_in']} out={c['chars_out']}")

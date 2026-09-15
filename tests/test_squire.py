@@ -662,5 +662,5 @@ def test_stats_excludes_legacy_pre_source_fixture_rows(tmp_path):
     )
     env = {**DOWN, "SQUIRE_LEDGER": str(ledger)}
     p = run("stats", env=env)
-    assert "1 calls logged" in p.stdout  # only the non-matching row counted
+    assert "1 model-backed calls logged" in p.stdout  # only the non-matching row counted
     assert "1 test rows excluded, not deleted" in p.stdout

@@ -4,6 +4,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-09-15
+### Fixed
+- **Short `squire run` passthroughs are now logged.** Output of 60 lines or fewer is still shown raw with no model
+  call, but it now writes a ledger row marked `"passthrough": true`, so usage is no longer undercounted. `squire stats`,
+  `scripts/squire_report.py` and the public-stats block report passthrough runs as a separate count and exclude them
+  from every savings total.
+
 ## [0.2.17] - 2026-09-15
 ### Changed
 - **README and docs/SAVINGS.md figures** are current (195 sessions, 26,000:1 cache-read to uncached input,

@@ -162,6 +162,8 @@ def estimate_ledger_savings(ledger_rows, session_id_to_turns=None):
        file. Calls with session=None (old ledger format, or run outside a Claude Code session)
        are counted separately and reported as UNKNOWN -- never silently folded into the estimate.
     """
+    passthrough_calls = sum(1 for r in ledger_rows if r.get("passthrough"))
+    ledger_rows = [r for r in ledger_rows if not r.get("passthrough")]  # logged for usage, saved nothing
     total_calls = len(ledger_rows)
     total_chars_in = sum(r.get("chars_in", 0) for r in ledger_rows)
     total_chars_out = sum(r.get("chars_out", 0) for r in ledger_rows)
@@ -190,6 +192,7 @@ def estimate_ledger_savings(ledger_rows, session_id_to_turns=None):
 
     return {
         "calls": total_calls,
+        "passthrough_calls": passthrough_calls,
         "chars_in": total_chars_in,
         "chars_out": total_chars_out,
         "chars_saved": chars_saved,
@@ -235,8 +238,12 @@ def public_stats(ledger_rows):
     date_from = datetime.datetime.fromtimestamp(min(stamps), datetime.timezone.utc).strftime("%Y-%m-%d") if stamps else "UNKNOWN"
     date_to = datetime.datetime.fromtimestamp(max(stamps), datetime.timezone.utc).strftime("%Y-%m-%d") if stamps else "UNKNOWN"
 
+    # Short `run` passthroughs: counted as usage, excluded from every savings figure.
+    passthrough_calls = sum(1 for r in ledger_rows if r.get("passthrough"))
+    model_rows = [r for r in ledger_rows if not r.get("passthrough")]
+
     by_cmd = {}
-    for r in ledger_rows:
+    for r in model_rows:
         c = by_cmd.setdefault(r.get("cmd", "unknown"), {"calls": 0, "ok": 0, "chars_in": 0, "chars_out": 0})
         c["calls"] += 1
         if r.get("backend_ok"):
@@ -244,7 +251,7 @@ def public_stats(ledger_rows):
         c["chars_in"] += r.get("chars_in", 0) or 0
         c["chars_out"] += r.get("chars_out", 0) or 0
 
-    total_calls = len(ledger_rows)
+    total_calls = len(model_rows)
     total_ok = sum(c["ok"] for c in by_cmd.values())
     total_chars_in = sum(c["chars_in"] for c in by_cmd.values())
     total_chars_out = sum(c["chars_out"] for c in by_cmd.values())
@@ -262,6 +269,7 @@ def public_stats(ledger_rows):
     return {
         "date_from": date_from, "date_to": date_to,
         "total_calls": total_calls,
+        "passthrough_calls": passthrough_calls,
         "overall_ok_rate_pct": round(100 * total_ok / total_calls, 1) if total_calls else 0.0,
         "overall_unknown_rate_pct": round(100 - (100 * total_ok / total_calls if total_calls else 0.0), 1),
         "chars_in": total_chars_in, "chars_out": total_chars_out, "chars_saved": chars_saved,
@@ -275,9 +283,13 @@ def render_public_markdown(stats):
         body = "_No ledger data yet for this range._"
     else:
         call_word = "call" if stats["total_calls"] == 1 else "calls"
+        pt = stats.get("passthrough_calls", 0)
+        pt_word = "run" if pt == 1 else "runs"
         lines = [
-            f"**{stats['date_from']} to {stats['date_to']}** &mdash; {stats['total_calls']} real {call_word} "
-            f"logged, {stats['overall_ok_rate_pct']}% backend-ok ({stats['overall_unknown_rate_pct']}% `UNKNOWN`).",
+            f"**{stats['date_from']} to {stats['date_to']}** &mdash; {stats['total_calls']} model-backed {call_word} "
+            f"logged, {stats['overall_ok_rate_pct']}% backend-ok ({stats['overall_unknown_rate_pct']}% `UNKNOWN`), "
+            f"plus {pt} short `run` passthrough {pt_word} (60 lines of output or fewer, shown raw with no model call "
+            "and no savings counted).",
             "",
             "| Command | Calls | Ok rate | `UNKNOWN` rate | Chars in | Chars out | Chars saved |",
             "|---|---|---|---|---|---|---|",
