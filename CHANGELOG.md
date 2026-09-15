@@ -3,6 +3,10 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- **`scripts/sync_to_mirror.py --apply`** no longer hardcodes `python3.13` for the mirror's test run: it uses
+  `$SQUIRE_TEST_PYTHON`, defaulting to the running interpreter, so the weekly refresh works on a host without python3.13.
+
 ### Added
 - **`scripts/squire_report.py --public`/`--check`/`--write`**: an honest, generated public-stats
   block (date range, real calls, per-command ok-rate and `UNKNOWN` rate, REAL chars in/out/saved,
@@ -11,6 +15,10 @@ versions follow [SemVer](https://semver.org/).
   `<!-- SQUIRE-PUBLIC-STATS:BEGIN/END -->` markers. Fixture rows are excluded (same `is_test_row`
   squire stats already uses), and the default window starts at the ledger cutoff the owner set
   for enforced usage (`--since` overrides it). No hostnames, paths or usernames in the output.
+- **`squire-public-stats-refresh.timer`/`.service`** (systemd `--user`, weekly): regenerates the
+  public-stats block, commits it if changed, and syncs+publishes the GitHub mirror
+  (`scripts/weekly_public_stats_refresh.sh`) so the README and SAVINGS.md never go stale between
+  manual passes. No root; installed with `systemctl --user`.
 
 ### Fixed
 - **`squire ask` no longer returns a bare `UNKNOWN` on inputs over one CHUNK.** A per-chunk note
