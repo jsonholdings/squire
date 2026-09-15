@@ -4,6 +4,47 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-09-14
+### Added
+- **Canonical PreToolUse enforcement hooks, moved into squire itself.** `hooks/pretool_wrap.py`'s
+  `NOISY_RE` now also wraps `ssh`, any `docker` subcommand, `flatpak-spawn`, bare `curl`,
+  `journalctl` and `dmesg` (previously build/test/lint/install tools only), so these route
+  through `squire run --` like the rest. A `# squire-raw: <reason>` marker anywhere in a command
+  skips wrap/deny enforcement entirely (an intentional, auditable escape hatch, not a silent
+  bypass) and is logged to `~/.squire/raw_overrides.jsonl` (ts, session, tool, reason, first 80
+  chars of the command); the ledger write is wrapped in try/except so a ledger failure never
+  blocks the underlying command.
+- **`hooks/search_guard.py`** (new): a PreToolUse hook for Bash and Grep that denies broad raw
+  search sweeps -- `grep -r`/`-R`, bare `rg`, `find ... | xargs grep` -- unless marked
+  `# squire-raw: <reason>`, pointing at `squire grep` instead. A single explicit
+  `grep <pattern> <one-file>` is never denied. The Grep tool call has no command string to carry
+  a marker, so an unnarrowed call (no `path`/`glob`) is allowed through with `additionalContext`
+  and logged to the same ledger with reason `grep-tool-unnarrowed`, rather than denied outright.
+  Fails open on `SQUIRE_HOOK_DISABLE=1`, malformed JSON, or any exception.
+- **`hooks/usage_report.py`** (new): the canonical version of workstation-config's
+  `squire_usage_report.py` (that copy predates squire's own `hooks/` and is expected to vendor
+  from here going forward). Adds a per-session table (squire calls by cmd, plus
+  `raw_overrides.jsonl` count) alongside the existing global/per-session summary; CLI flags stay
+  backward-compatible (`--ledger`, `--session`, `--json`, plus new `--overrides` and
+  `--no-sessions`).
+- Tests: `tests/test_pretool_wrap_enforcement.py` and `tests/test_search_guard.py` prove both
+  directions of every new rule (wrapped vs. passthrough, denied vs. marker-exempt vs.
+  single-file-exempt, ledger writes, fail-open on disable/malformed input/ledger-write failure).
+
+### Fixed
+- **Both new hooks matched keywords against the WHOLE command string, not the actual command
+  being run.** `grep -r`/`rg`/`pytest`/etc. appearing inside a quoted argument to an unrelated
+  command -- `echo "run pytest later"`, a JSON string piped through another program -- triggered
+  a wrong deny or wrap. Separately, a multi-line Bash tool call (one `command` string joined by
+  real newlines) had every line after the first merged into the first line's argument list,
+  because shlex's default whitespace set treats `\n` as plain whitespace -- a genuine `grep -r`
+  sitting on line 3 of a command sailed through undenied. Both hooks now tokenize the command
+  into pipeline segments (shlex, quote-aware, newline added as a statement separator) and check
+  only each segment's actual program (`argv[0]`), never substrings of its arguments. A command
+  that can't be safely tokenized (unbalanced quotes) is left untouched. 9 new regression tests
+  lock in both the false-positive and the newline fix, alongside the true positives they sit
+  next to.
+
 ## [0.2.15] - 2026-09-13
 ### Added
 - **GPU hand-off with NCP-ArchPreview (2026-09-13).** `llm()` and `embed()` now check

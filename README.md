@@ -198,10 +198,15 @@ stripped before any prompt or embedding request leaves the process. Full contrac
 - Call squire directly from a session: add a line to your `CLAUDE.md` telling the agent to route
   noisy commands through `squire run --` and long files through `squire sum` / `squire ask`
   (see [`integrations/CLAUDE-snippet.md`](integrations/CLAUDE-snippet.md)).
-- `hooks/pretool_wrap.py` — a PreToolUse hook that rewrites noisy build/test/lint commands to run
-  through `squire run` before execution, so only the condensed output ever reaches the model. This
-  is the hook that actually saves tokens; `hooks/posttool_condense.py` is kept opt-in and
-  NOT recommended, since a PostToolUse hook can only add context on top of output already shown.
+- `hooks/pretool_wrap.py` — a PreToolUse hook that rewrites noisy build/test/lint/ssh/docker/curl/
+  log-scan commands to run through `squire run` before execution, so only the condensed output
+  ever reaches the model. This is the hook that actually saves tokens; `hooks/posttool_condense.py`
+  is kept opt-in and NOT recommended, since a PostToolUse hook can only add context on top of
+  output already shown.
+- `hooks/search_guard.py` — a PreToolUse hook that DENIES a raw `grep -r`/`rg`/`find|xargs grep`
+  sweep, pointing at `squire grep` instead; `# squire-raw: <reason>` overrides it and logs the
+  override. `hooks/usage_report.py` reads that ledger plus squire's own, per session.
+  See [`docs/claude-code.md`](docs/claude-code.md) for the settings.json wiring.
 - `mcp/squire_mcp.py` — a stdlib MCP stdio server (protocol 2025-06-18) exposing `squire_run/sum/
   ask/draft/diff/grep/triage/stats` as tools; register with `claude mcp add squire -- python3
   mcp/squire_mcp.py`.

@@ -17,42 +17,126 @@ Quoting: the original command is passed to squire as ONE argv element via `bash 
 `squire run -- bash -c '<orig>'` preserves the original's own quoting untouched (shlex.quote on
 the whole string, not word-by-word -- word-splitting first would break quoted args containing
 spaces or shell metacharacters).
+
+2026-09-14 fix (S-URGENT): the noisy/never-wrap checks used to be plain regex substring matches
+against the WHOLE command string, so the literal word `pytest` or `git` appearing anywhere --
+including inside a quoted argument to an unrelated command, e.g. `echo "run pytest later"` or a
+JSON string like `echo '{"cmd":"pytest -q"}'` piped to another program -- triggered wrap/skip
+decisions that had nothing to do with what actually runs. Matching is now done on the TOKENIZED
+pipeline: the command is split into segments on real shell operators (`|`, `&&`, `||`, `;`, `&`)
+using `shlex` (which respects quoting, so text inside `'...'`/`"..."` is one opaque token and
+never inspected for keywords), and only each segment's actual PROGRAM (argv[0], basename) is
+checked against the noisy/never-wrap tables -- never substrings of arguments. A command that
+can't be safely tokenized (unbalanced quotes) is left untouched (fail toward not wrapping).
 """
 import json
+import os
 import re
 import shlex
 import shutil
 import sys
-import os
+import time
 
-NOISY_RE = re.compile(
-    r"""(?x)
-    (?:^|&&|\|\|| ; |\s) (?:
-        pytest
-        | python3?\s+-m\s+pytest
-        | (?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build|install)
-        | jest | vitest
-        | cargo\s+(?:build|test)
-        | go\s+(?:build|test)
-        | make
-        | mvn(?:\s|$)
-        | gradle(?:w)?(?:\s|$)
-        | dotnet\s+(?:build|test)
-        | pip3?\s+install
-        | docker\s+build
-        | tox
-        | ruff(?:\s|$)
-        | mypy(?:\s|$)
-        | eslint(?:\s|$)
-        | tsc(?:\s|$)
-    )
-    """,
-)
+NOISY_PROGRAMS = {
+    "pytest", "jest", "vitest", "make", "mvn", "tox", "ruff", "mypy", "eslint", "tsc",
+    "ssh", "flatpak-spawn", "curl", "journalctl", "dmesg", "docker",
+}
+NEVER_WRAP_PROGRAMS = {"git", "session-claim", "cat", "sed", "grep", "ls", "squire"}
+PIPE_TRIM_PROGRAMS = {"head", "tail", "grep"}
+SHELL_OPS = {"|", "||", "&&", ";", "&"}
 
-NEVER_WRAP_RE = re.compile(r"(?:^|\s)(git|session-claim|cat|sed|grep|ls|squire)(?:\s|$)")
-PIPE_TO_TRIM_RE = re.compile(r"\|\s*(head|tail|grep)\b")
 INTERACTIVE_MARKERS = ("-it ", " -i ", "read -p", "/dev/tty")
 HEREDOC_RE = re.compile(r"<<[-~]?\s*['\"]?\w+")
+
+
+def tokenize_pipeline(command):
+    """Split `command` into (operator_before, argv) segments, tokenized with shlex so quoted
+    text is never split or keyword-matched. Raises ValueError on unbalanced quotes -- caller
+    treats that as "can't tell", never as a match.
+
+    A bare newline is a statement separator too (a multi-line Bash tool call is one `command`
+    string joined by real `\\n`s) -- 2026-09-14 fix: shlex's default whitespace set SWALLOWS
+    newlines as plain whitespace, which merged every line of a multi-line command into one
+    giant segment and hid a noisy/denied command sitting on its own later line entirely (found
+    live: a 3-line command whose 3rd line was a real `grep -r` was not denied). `\\n` is added
+    to punctuation_chars and removed from whitespace so it survives as its own separator token,
+    while a newline INSIDE a quoted string (part of the actual argument text) is unaffected --
+    shlex only treats it as a separator outside of quotes."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&;\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    segments = []
+    current = []
+    op_before = None
+    for tok in tokens:
+        if tok == "\n":
+            if current:
+                segments.append((op_before, current))
+            current = []
+            op_before = None
+            continue
+        if tok in SHELL_OPS:
+            if current:
+                segments.append((op_before, current))
+            current = []
+            op_before = tok
+        else:
+            current.append(tok)
+    if current:
+        segments.append((op_before, current))
+    return segments
+
+
+def program_name(argv):
+    return os.path.basename(argv[0]) if argv else ""
+
+
+def is_noisy_segment(prog, argv):
+    if prog in NOISY_PROGRAMS:
+        return True
+    if prog in ("python", "python3") and len(argv) >= 3 and argv[1] == "-m" and argv[2] == "pytest":
+        return True
+    if prog in ("npm", "pnpm", "yarn"):
+        rest = argv[1:]
+        if rest and rest[0] == "run":
+            rest = rest[1:]
+        return bool(rest) and rest[0] in ("test", "build", "install")
+    if prog in ("cargo", "go", "dotnet"):
+        return len(argv) >= 2 and argv[1] in ("build", "test")
+    if prog in ("gradle", "gradlew"):
+        return True
+    if prog in ("pip", "pip3"):
+        return len(argv) >= 2 and argv[1] == "install"
+    return False
+
+# `# squire-raw: <reason>` anywhere in the command skips wrap/deny enforcement entirely --
+# an intentional, auditable escape hatch rather than a silent bypass. Logged to a ledger
+# (~/.squire/raw_overrides.jsonl) so overuse is visible without blocking the command that
+# carries it (fail open: a ledger write failure never blocks the underlying command).
+RAW_OVERRIDE_RE = re.compile(r"#\s*squire-raw:\s*(?P<reason>.+)")
+RAW_OVERRIDE_LEDGER = os.path.expanduser("~/.squire/raw_overrides.jsonl")
+
+
+def find_raw_override(command):
+    m = RAW_OVERRIDE_RE.search(command or "")
+    return m.group("reason").strip() if m else None
+
+
+def log_raw_override(payload, tool_name, command, reason):
+    try:
+        os.makedirs(os.path.dirname(RAW_OVERRIDE_LEDGER), exist_ok=True)
+        row = {
+            "ts": time.time(),
+            "session": (payload or {}).get("session_id", "unknown"),
+            "tool": tool_name,
+            "reason": reason,
+            "cmd_head": (command or "")[:80],
+        }
+        with open(RAW_OVERRIDE_LEDGER, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError:
+        pass
 
 
 def find_squire_bin():
@@ -70,17 +154,27 @@ def should_wrap(command):
     cmd = (command or "").strip()
     if not cmd:
         return False
-    if NEVER_WRAP_RE.search(cmd):
-        return False
-    if not NOISY_RE.search(cmd):
-        return False
-    if PIPE_TO_TRIM_RE.search(cmd):
-        return False
     if HEREDOC_RE.search(cmd):
         return False
     if any(m in cmd for m in INTERACTIVE_MARKERS):
         return False
-    return True
+    try:
+        segments = tokenize_pipeline(cmd)
+    except ValueError:
+        return False  # can't safely tokenize (e.g. unbalanced quotes) -- don't touch it
+    if not segments:
+        return False
+
+    noisy_found = False
+    for op, argv in segments:
+        prog = program_name(argv)
+        if prog in NEVER_WRAP_PROGRAMS:
+            return False
+        if op == "|" and prog in PIPE_TRIM_PROGRAMS:
+            return False
+        if is_noisy_segment(prog, argv):
+            noisy_found = True
+    return noisy_found
 
 
 def build_wrapped_command(original):
@@ -104,6 +198,12 @@ def main():
         return 0
 
     command = (payload.get("tool_input") or {}).get("command", "")
+
+    reason = find_raw_override(command)
+    if reason:
+        log_raw_override(payload, "Bash", command, reason)
+        return 0
+
     if not should_wrap(command):
         return 0
 
