@@ -431,8 +431,16 @@ def _condense_core(text, task, max_tokens=300):
         return llm(f"{task}\n\n---\n{parts[0]}\n---", max_tokens), None
     notes = [llm(f"{task} (part {i + 1}/{len(parts)}; be brief)\n\n---\n{p}\n---", 150)
              for i, p in enumerate(parts)]
-    if any(n.startswith("UNKNOWN") for n in notes):
-        return next(n for n in notes if n.startswith("UNKNOWN")), notes
+    # 2026-09-14: a real backend-error sentinel is always "UNKNOWN: <reason>" (see llm()'s three
+    # returns). A per-chunk note that is literally the bare word "UNKNOWN" is the MODEL correctly
+    # reporting "the answer isn't in this chunk" for an ask-style task -- normal and expected for
+    # most chunks of a multi-chunk file, not a backend failure. Treating any bare "UNKNOWN" note as
+    # fatal used to abort the whole combine step on the first chunk that didn't contain the answer,
+    # so `squire ask` on anything over one CHUNK (~24k chars) came back with a bare "UNKNOWN" and no
+    # reason even though the backend was healthy and later chunks may have had the real answer.
+    # Only a note with a reason (the colon) is a genuine backend error worth aborting for.
+    if any(n.startswith("UNKNOWN:") for n in notes):
+        return next(n for n in notes if n.startswith("UNKNOWN:")), notes
     return llm(f"{task}\nCombine these partial notes into one answer:\n\n" + "\n".join(notes), max_tokens), notes
 
 
@@ -456,7 +464,7 @@ def condense_verified(text, task, max_tokens=300):
     text in windows, so their concatenation -- not a tail slice of the raw text -- is what the
     verify check should compare the final summary against whenever the input was chunked."""
     summary, notes = _condense_core(text, task, max_tokens)
-    if summary.startswith("UNKNOWN"):
+    if summary.startswith("UNKNOWN:"):
         return summary, None
     check_source = "\n".join(notes) if notes else text
     check = llm(
@@ -464,7 +472,7 @@ def condense_verified(text, task, max_tokens=300):
         "invents nothing not supported by the source and omits no failure/error the source contains. "
         "Otherwise reply with one short sentence naming the specific inaccuracy.\n\n"
         f"SOURCE:\n{check_source[-CHUNK:]}\n\nSUMMARY:\n{summary}", 60)
-    if check.startswith("UNKNOWN"):
+    if check.startswith("UNKNOWN:"):
         return summary, None
     flag = None if check.strip().rstrip(".").upper() == "OK" else check.strip()
     return summary, flag
@@ -549,7 +557,7 @@ def cmd_run(argv):
         summary, flag = condense_verified(out, "Summarize this command output for a busy engineer in at most 8 bullets. "
                                           "List every failing test/error with file:line and the one-line cause. "
                                           "Say 'no errors seen' only if there are none. Never invent names.")
-        ok = not summary.startswith("UNKNOWN")
+        ok = not summary.startswith("UNKNOWN:")
         wait_s, gen_s = get_call_timing()
         log_call("run", len(out), len(summary), ok, wait_s, gen_s,
                   exit_code=p.returncode, duration_s=round(time.monotonic() - run_start, 2))
@@ -578,7 +586,7 @@ def cmd_diff(argv):
     reset_call_timing()
     summary, flag = condense_verified(diff_text, "Summarize this git diff by file/module. Separate logic changes "
                                       "from formatting/rename-only changes. Be factual, keep exact file paths and names.")
-    ok = not summary.startswith("UNKNOWN")
+    ok = not summary.startswith("UNKNOWN:")
     wait_s, gen_s = get_call_timing()
     log_call("diff", len(diff_text), len(summary), ok, wait_s, gen_s)
     if not json_mode:
@@ -666,9 +674,18 @@ def cmd_grep(argv):
         sys.exit('usage: squire grep "query" [path] [--top N] [--reindex] [--timeout S] [--json]')
     query, path = argv[0], (argv[1] if len(argv) > 1 else ".")
     path = os.path.abspath(path)
-    root = repo_root(path) if os.path.isdir(path) else None
+    if not os.path.exists(path):
+        sys.exit(f"[squire] no such file or directory: {path}")
+    # 2026-09-14: a single FILE path used to walk itself into `root`. os.path.isdir(path) is False
+    # for a file, so `root` fell through to `None` and then to `path` (the file), and list_files()
+    # does os.walk(root) -- os.walk on a non-directory yields nothing, so the file was silently
+    # indexed as 0 files and every search came back empty with no error. `root` must always be a
+    # DIRECTORY (the file's own repo, or its parent dir outside a repo); the existing prefix filter
+    # below already narrows to one file correctly once `root` is a real directory to walk/list.
+    scan_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    root = repo_root(scan_dir) if os.path.isdir(scan_dir) else None
     in_git = root is not None
-    root = root or path
+    root = root or scan_dir
     files = list_files(root, in_git)
     if path != root:
         prefix = os.path.relpath(path, root) + os.sep
@@ -826,13 +843,13 @@ def compute_triage(text):
         listing = "\n\n".join(f"ITEM {n + 1}: {i['heading']}\n" + "\n".join(i["body"])[:1500] for n, i in enumerate(items[:25]))
         raw = llm("For each ITEM below, write exactly one line 'N: <what it blocks and how urgent, max 20 words>'. "
                   "Use only the item text; say 'unclear' if it does not say.\n\n" + listing, 60 * min(len(items), 25) + 50)
-        if not raw.startswith("UNKNOWN"):
+        if not raw.startswith("UNKNOWN:"):
             for line in raw.splitlines():
                 # Models echo the template loosely: "3: x", "ITEM 3: x", even "N: ITEM 3: x".
                 m = re.search(r"ITEM\s*(\d+)\s*[:.)-]?\s*(.+)", line) or re.match(r"\s*(\d+)\s*[:.)-]\s*(.+)", line)
                 if m:
                     guesses[int(m.group(1)) - 1] = m.group(2).strip()
-        backend_ok = not raw.startswith("UNKNOWN")
+        backend_ok = not raw.startswith("UNKNOWN:")
     else:
         backend_ok = True
     for n, i in enumerate(items):
@@ -996,7 +1013,7 @@ def _run_queued_job(row):
               "changes. Be factual, keep exact file paths and names.")[0]
     else:
         return False, f"unknown queued command {cmd!r}"
-    return not out.startswith("UNKNOWN"), out
+    return not out.startswith("UNKNOWN:"), out
 
 
 def _requeue_dead_workers(conn):
@@ -1282,14 +1299,21 @@ def main():
         out = llm(f"{rest[0]}\n\nSource material (may be empty):\n{text[:CHUNK]}", 1200)
     else:
         sys.exit(f"unknown command {cmd!r}; see squire --help")
-    ok = not out.startswith("UNKNOWN")
+    ok = not out.startswith("UNKNOWN:")
     wait_s, gen_s = get_call_timing()
     log_call(cmd, len(text), len(out), ok, wait_s, gen_s)
     if json_mode:
         print(json.dumps({"cmd": cmd, "exit_code": None, "raw_tail": None, "summary": out,
                           "assumed": True, "backend_ok": ok, "verify_flag": None}))
     else:
-        print(out if cmd == "draft" else "[squire] " + out)
+        # `ask`'s own prompt tells the model to answer the bare word "UNKNOWN" when the text
+        # genuinely doesn't contain the answer -- a healthy backend giving a real answer, not a
+        # failure (a failure sentinel always reads "UNKNOWN: <reason>" and prints as-is below).
+        # Print it distinctly so it never reads like the backend-down case.
+        if cmd == "ask" and out == "UNKNOWN":
+            print("[squire] not found in the given text (ASSUMED: model checked, backend OK)")
+        else:
+            print(out if cmd == "draft" else "[squire] " + out)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,30 @@ All notable changes to Squire are documented here. Format: [Keep a Changelog](ht
 versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- **`scripts/squire_report.py --public`/`--check`/`--write`**: an honest, generated public-stats
+  block (date range, real calls, per-command ok-rate and `UNKNOWN` rate, REAL chars in/out/saved,
+  a clearly-labelled chars/4 token estimate) for README.md and docs/SAVINGS.md. `--check` fails
+  when the published block no longer matches the ledger; `--write` regenerates it in place between
+  `<!-- SQUIRE-PUBLIC-STATS:BEGIN/END -->` markers. Fixture rows are excluded (same `is_test_row`
+  squire stats already uses), and the default window starts at the ledger cutoff the owner set
+  for enforced usage (`--since` overrides it). No hostnames, paths or usernames in the output.
+
+### Fixed
+- **`squire ask` no longer returns a bare `UNKNOWN` on inputs over one CHUNK.** A per-chunk note
+  that is literally the word `UNKNOWN` means the model correctly found nothing in THAT chunk --
+  expected for most chunks of a multi-chunk file -- not a backend failure. It was being treated
+  the same as a real backend-error sentinel (always `UNKNOWN: <reason>`), aborting the combine
+  step on the first chunk without the answer even when a later chunk had it. Fixed by detecting
+  the sentinel by its `UNKNOWN:` colon+reason instead of the bare word, everywhere that check is
+  made. `squire ask` also now prints a distinct "not found in the given text" message instead of
+  a bare `UNKNOWN` for a genuine no-match answer, so it never reads like a downed backend.
+- **`squire grep <single-file>` no longer silently searches nothing.** Passing a file (not a
+  directory) computed `root` as the file itself; `list_files()`'s `os.walk(root)` yields nothing
+  for a non-directory, so the file was "indexed" as 0 files with no error and every query came
+  back empty. `root` now always resolves to a real directory (the file's repo root, or its
+  parent directory outside a repo) and the existing prefix filter narrows the search to that one
+  file.
 
 ## [0.2.16] - 2026-09-14
 ### Added

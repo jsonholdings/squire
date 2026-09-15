@@ -588,6 +588,70 @@ def test_stats_excludes_source_test_rows_but_keeps_them_in_the_file(tmp_path):
     assert len(ledger.read_text().splitlines()) == 2  # nothing removed from the file
 
 
+def test_ask_multi_chunk_survives_a_chunk_that_found_nothing(monkeypatch):
+    # 2026-09-14: `squire ask` on anything over one CHUNK used to come back with a bare "UNKNOWN"
+    # and no reason as soon as ANY single chunk's answer was the literal word "UNKNOWN" -- which
+    # is the model correctly reporting "not in THIS chunk", expected for most chunks of a
+    # multi-chunk file, not a backend failure. The ledger showed real, non-trivial gen_s (a live
+    # model call) alongside chars_out=7 ("UNKNOWN") on inputs far bigger than one CHUNK, proving
+    # the backend was healthy and simply never got to combine the chunk that DID have the answer.
+    monkeypatch.setattr(sq, "CHUNK", 200)  # forces multiple chunks below without huge fixtures
+
+    def fake_llm(prompt, max_tokens=300):
+        if "part 1/2" in prompt:
+            return "UNKNOWN"  # the answer genuinely isn't in this chunk
+        if "part 2/2" in prompt:
+            return "the answer is 42"
+        if "Combine these partial notes" in prompt:
+            return "The answer is 42."
+        raise AssertionError(f"unexpected prompt: {prompt!r}")
+
+    monkeypatch.setattr(sq, "llm", fake_llm)
+    text = "A" * 200 + "B" * 200
+    out = sq.condense(text, "Answer using ONLY this text; say UNKNOWN if it is not there. Question: what is the answer?")
+    assert out == "The answer is 42."  # not a bare "UNKNOWN"
+
+
+def test_ask_multi_chunk_still_aborts_on_a_real_backend_error(monkeypatch):
+    # Control for the test above: a REAL backend-error sentinel (always "UNKNOWN: <reason>",
+    # never the bare word) on any chunk must still abort the combine step -- proves the fix only
+    # stopped treating the model's own bare "UNKNOWN" as fatal, not genuine backend failures.
+    monkeypatch.setattr(sq, "CHUNK", 200)
+
+    def fake_llm(prompt, max_tokens=300):
+        if "part 1/2" in prompt:
+            return "UNKNOWN: local model unavailable (ConnectionError: refused)"
+        if "part 2/2" in prompt:
+            return "the answer is 42"
+        raise AssertionError(f"unexpected prompt (combine should never be reached): {prompt!r}")
+
+    monkeypatch.setattr(sq, "llm", fake_llm)
+    text = "A" * 200 + "B" * 200
+    out = sq.condense(text, "Answer using ONLY this text; say UNKNOWN if it is not there. Question: what is the answer?")
+    assert out.startswith("UNKNOWN: local model unavailable")
+
+
+def test_grep_accepts_a_single_file_path_not_only_a_directory(tmp_path, fake_ollama):
+    # 2026-09-14: `squire grep query some/file.py` (a FILE, not a directory) used to compute
+    # `root = the file itself` (os.path.isdir(path) is False so the repo-root lookup and the
+    # directory fallback both skipped), then list_files() called os.walk() on that non-directory
+    # -- os.walk yields nothing for a file, so the file was silently "indexed" as 0 files and
+    # every search came back empty with no error at all.
+    base, handler = fake_ollama
+    handler.delay_s = 0.0
+    target = tmp_path / "a.py"
+    target.write_text("def frobulate_widget():\n    pass\n")
+    (tmp_path / "b.py").write_text("def unrelated():\n    pass\n")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock")}
+    p = subprocess.run([sys.executable, str(SQUIRE), "grep", "widget", str(target), "--json"],
+                       text=True, capture_output=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stdout + p.stderr
+    obj = json.loads(p.stdout)
+    assert obj["files_indexed"] == 1  # only the one file, not the whole directory
+    assert obj["results"] != []  # control: before the fix this was always []
+
+
 def test_stats_excludes_legacy_pre_source_fixture_rows(tmp_path):
     # A row written before the `source` field existed (S1-era), matching one of the exact
     # deterministic fixture shapes the S3-check found. Must still be excluded by signature alone.
