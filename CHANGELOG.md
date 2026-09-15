@@ -4,6 +4,20 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-09-15
+### Added
+- **Every public squire number is now generated, never hand-typed.** `scripts/squire_report.py` gained
+  `full_history_stats()` plus three new generated blocks (`SQUIRE-HEADLINE`, `SQUIRE-SAVINGS-STATS`,
+  `SQUIRE-SITE-STATS`), so the README's numbered headline, `docs/SAVINGS.md`'s two MEASURED tables +
+  ESTIMATED row, and the jsonholdings.com open-source card's three `<dl>` stats are all produced by
+  `--write`/`--check` from real ledger and session data. `write_block_into`/`check_block_in` now update
+  every known marker pair present in a file instead of one hardcoded block.
+### Changed
+- The public-stats refresh (`scripts/public_stats_refresh.sh`, replacing `weekly_public_stats_refresh.sh`)
+  now also regenerates the site card, runs a structural check (tag balance + JSON-LD parse) and
+  `render-check`'s `--dir` pass before publishing a site change, and verifies the live card via a
+  Cloudflare edge. The systemd timer moved from weekly to daily (06:19).
+
 ## [0.2.18] - 2026-09-15
 ### Fixed
 - **Short `squire run` passthroughs are now logged.** Output of 60 lines or fewer is still shown raw with no model
