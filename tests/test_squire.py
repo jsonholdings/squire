@@ -89,6 +89,21 @@ def test_nested_launcher_does_not_hang_on_inherited_stdin():
     assert "got 0 bytes from stdin" in p.stdout
 
 
+def test_missing_binary_never_reported_as_success():
+    # Multi-arg form (shell=False) used to let subprocess.run's FileNotFoundError escape
+    # uncaught: a bare Python traceback, exit=1, and no "[squire] exit=" line at all -- a
+    # caller checking for that line, or a wrapper feeding this into `bash -c`, could read
+    # the absence as "it didn't fail loudly" rather than "it never ran". This must always
+    # come back non-zero, real (127, the shell convention for command-not-found), visible,
+    # and NEVER 0.
+    p = run("run", "--", "squire-test-definitely-not-a-real-binary-xyz", "--version")
+    assert p.returncode == 127
+    assert p.returncode != 0
+    assert "[squire] exit=127" in p.stdout
+    assert "command not found" in p.stdout
+    assert "Traceback" not in p.stdout and "Traceback" not in p.stderr
+
+
 def test_run_timeout_preserves_exit_code_and_output():
     code = "import sys, time\nprint('before sleep'); sys.stdout.flush()\ntime.sleep(5)\nsys.exit(0)"
     env = {**DOWN, "SQUIRE_RUN_TIMEOUT": "1"}
@@ -376,6 +391,31 @@ def test_grep_backend_failure_still_logs_a_ledger_row(tmp_path):
     assert grep_rows[0]["backend_ok"] is False
     assert grep_rows[0]["status"] in ("timeout", "error")
     assert grep_rows[0]["gen_s"] is not None and grep_rows[0]["gen_s"] >= 0
+
+
+def test_grep_avoided_bytes_is_hit_files_not_whole_corpus(tmp_path, monkeypatch):
+    # Item 2 of the 2026-09-15 usage-analysis fix list: chars_in for grep is the whole indexed
+    # corpus (real, one call ingested 10.9M chars in production) -- a caller would never have
+    # read that raw, so it's not a defensible savings denominator. chars_avoided_ESTIMATE must
+    # be much smaller: only the files that actually came back as hits, each capped at a
+    # realistic read window, never the full indexed corpus size. Big control file (50k chars,
+    # NOT a hit) proves the corpus isn't silently included; small hit file proves a real hit
+    # still counts.
+    (tmp_path / "hit.py").write_text("def frobulate_widget():\n    pass\n")
+    (tmp_path / "big_irrelevant.py").write_text("# filler\n" * 20000)  # ~150KB, never queried for
+    ledger = tmp_path / "l.jsonl"
+    monkeypatch.setattr(sq, "LEDGER", str(ledger))
+    monkeypatch.setattr(sq, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sq.cmd_grep(["widget", str(tmp_path)])
+    rows = [json.loads(l) for l in ledger.read_text().splitlines() if json.loads(l)["cmd"] == "grep"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["chars_in"] > 100000  # corpus (includes the big filler file) -- unchanged field
+    assert row["chars_avoided_ESTIMATE"] < 10000  # nowhere near the corpus; only hit files, capped
+    assert row["chars_avoided_ESTIMATE"] < row["chars_in"]
 
 
 # ---------------------------------------------------------------- S11: grep lock/timeout fixes
@@ -693,3 +733,136 @@ def test_stats_excludes_legacy_pre_source_fixture_rows(tmp_path):
     p = run("stats", env=env)
     assert "1 model-backed calls logged" in p.stdout  # only the non-matching row counted
     assert "1 test rows excluded, not deleted" in p.stdout
+
+
+# ---------------------------------------------------------------- item 4: warm start
+
+def test_warmup_hook_disable_is_silent_noop():
+    # A TEST-NET address that must never be contacted (same pattern as
+    # test_remote_backend_reports_unknown_not_a_network_call). SQUIRE_HOOK_DISABLE=1 must skip
+    # BEFORE any network touch, not merely fail fast on one.
+    env = {**os.environ, "SQUIRE_HOOK_DISABLE": "1", "SQUIRE_OLLAMA": "http://203.0.113.9:11434"}
+    p = run("warmup", "--wait", env=env)
+    assert p.returncode == 0
+    assert p.stdout == ""  # no "warmup skipped"/"warmup OK" line at all -- a true no-op
+
+
+def test_warmup_wait_never_loads_a_model_when_backend_down():
+    p = run("warmup", "--wait", "--json")  # DOWN env by default
+    obj = json.loads(p.stdout)
+    assert obj["ok"] is False
+    assert "backend unreachable" in obj["reason"]
+
+
+def test_warmup_default_backgrounds_and_returns_immediately():
+    # Default (no --wait) must never block the CALLER on however long the model load takes --
+    # against a dead backend that would be near-instant anyway, so assert on wall time as the
+    # actual behavior under test, not just "it returned".
+    t0 = time.monotonic()
+    p = run("warmup")
+    dur = time.monotonic() - t0
+    assert p.returncode == 0
+    assert "background" in p.stdout
+    assert dur < 5  # backgrounded; must not wait for the child's own backend-down check
+
+
+# ---------------------------------------------------------------- item 5: cache + citations
+
+def test_cache_key_changes_with_model_and_prompt_version(monkeypatch):
+    monkeypatch.setattr(sq, "model", lambda: "model-a")
+    k1 = sq.cache_key("sum", "same text", "same task")
+    monkeypatch.setattr(sq, "model", lambda: "model-b")
+    k2 = sq.cache_key("sum", "same text", "same task")
+    assert k1 != k2  # different model -> different key, never a false cache hit across models
+    monkeypatch.setattr(sq, "model", lambda: "model-a")
+    monkeypatch.setattr(sq, "PROMPT_VERSION", "v2")
+    k3 = sq.cache_key("sum", "same text", "same task")
+    assert k1 != k3  # bumping PROMPT_VERSION invalidates every entry keyed under the old one
+
+
+def test_cache_round_trip_and_size_bound_eviction(monkeypatch, tmp_path):
+    monkeypatch.setattr(sq, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(sq, "CACHE_MAX_ENTRIES", 3)
+    assert sq.cache_get("missing") is None
+    for i in range(5):
+        sq.cache_put(f"key{i}", f"result{i}")
+        time.sleep(0.01)  # distinct mtimes so eviction order is deterministic
+    remaining = sorted(f for f in os.listdir(tmp_path) if f.endswith(".json"))
+    assert len(remaining) == 3  # bounded, never grows past CACHE_MAX_ENTRIES
+    assert sq.cache_get("key0") is None and sq.cache_get("key1") is None  # oldest evicted first
+    assert sq.cache_get("key4") == "result4"  # newest survives
+
+
+def test_sum_repeat_call_served_from_cache_without_a_model_call(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sq, "CACHE_DIR", str(tmp_path))
+    calls = []
+
+    def fake_condense(text, task, max_tokens=300):
+        calls.append(text)
+        assert text.startswith("1: hello world")  # line-numbered for citations, not the raw text
+        return "bullet one [L1]"
+    monkeypatch.setattr(sq, "condense", fake_condense)
+    src = tmp_path / "in.txt"
+    src.write_text("hello world")
+    monkeypatch.setattr(sys, "argv", ["squire", "sum", str(src), "--json"])
+    sq.main()
+    obj1 = json.loads(capsys.readouterr().out)
+    sq.main()  # identical argv again
+    obj2 = json.loads(capsys.readouterr().out)
+    assert len(calls) == 1  # second call never reached condense()/the model at all
+    assert obj1["cache_hit"] is False and obj2["cache_hit"] is True
+    assert obj1["summary"] == obj2["summary"] == "bullet one [L1]"
+
+
+# ---------------------------------------------------------------- item 6: literal check beside semantic ranking
+
+def test_literal_terms_drops_stopwords_and_short_tokens():
+    terms = sq.literal_terms("how does the widget frobulate a gadget")
+    assert "widget" in terms and "frobulate" in terms and "gadget" in terms
+    assert "how" not in terms and "does" not in terms and "the" not in terms and "a" not in terms
+
+
+def test_literal_search_finds_exact_line(tmp_path):
+    (tmp_path / "a.py").write_text("def unrelated():\n    pass\n\ndef frobulate_widget():\n    pass\n")
+    files = [("a.py", 0, 0)]
+    hits = sq.literal_search(str(tmp_path), files, ["frobulate_widget"])
+    assert len(hits) == 1 and hits[0]["file"] == "a.py" and hits[0]["line"] == 4
+
+
+def test_grep_reports_literal_hits_alongside_semantic_results(tmp_path, fake_ollama):
+    base, _handler = fake_ollama
+    (tmp_path / "a.py").write_text("def frobulate_widget():\n    pass\n")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock")}
+    p = subprocess.run([sys.executable, str(SQUIRE), "grep", "frobulate widget", str(tmp_path), "--json"],
+                       text=True, capture_output=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stdout + p.stderr
+    obj = json.loads(p.stdout)
+    assert "frobulate" in obj["literal_terms"] and "widget" in obj["literal_terms"]
+    assert len(obj["literal_hits"]) == 1
+    assert obj["literal_hits"][0]["file"] == "a.py"
+    assert obj["results"] != []  # semantic results still present, literal is additive not a replacement
+
+
+def test_grep_literal_zero_hits_reported_distinctly_from_semantic(tmp_path, fake_ollama):
+    # The fake backend always returns an identical embedding vector, so semantic `results` is
+    # never empty here regardless of content -- this test isolates that the LITERAL pass
+    # correctly reports zero when the term genuinely isn't in the file (proving it's a real
+    # exact search, not just echoing the semantic hit count).
+    base, _handler = fake_ollama
+    (tmp_path / "a.py").write_text("def something_else():\n    pass\n")
+    env = {**os.environ, "SQUIRE_OLLAMA": base, "SQUIRE_LLM_LOCK": str(tmp_path / "llm.lock"),
+           "SQUIRE_EMBED_LOCK": str(tmp_path / "embed.lock")}
+    p = subprocess.run([sys.executable, str(SQUIRE), "grep", "nonexistent_frobulator", str(tmp_path), "--json"],
+                       text=True, capture_output=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stdout + p.stderr
+    obj = json.loads(p.stdout)
+    assert obj["literal_hits"] == []
+    assert obj["results"] != []  # control: semantic still returns a hit, proving the two are independent
+
+
+def test_add_line_numbers_matches_source_lines():
+    numbered = sq.add_line_numbers("first\nsecond\nthird")
+    lines = numbered.splitlines()
+    assert lines[0].endswith(": first") and lines[0].strip().startswith("1")
+    assert lines[2].endswith(": third") and lines[2].strip().startswith("3")

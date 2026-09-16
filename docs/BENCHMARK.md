@@ -437,3 +437,81 @@ keys so the two can never be silently mixed.
   (`latency_by_concurrency`) or for the live cmd-workload cells, which are reported as-is.
 - Sync-vs-queue comparison (`squire submit`/`worker` vs synchronous `squire run`) from the
   original S6 spec: still not started, out of scope for S8b too.
+
+## Clean-room run (2026-09-15) — GPU confound retired, partial coverage, honest n per cell
+
+**What was stopped and verified idle before this run**, all by exact name, via
+`flatpak-spawn --host`: `qwen2.5:14b`, `gemma3:12b`, and `nomic-embed-text` (`ollama stop
+<name>` each), and the GPU-capable `ollama` docker container. Verified idle immediately
+before starting:
+
+- `nvidia-smi --query-gpu=memory.used,utilization.gpu`: **2 MiB, 0%**
+- `nvidia-smi --query-compute-apps`: **empty** (no compute processes)
+- `ollama ps`: **empty** (no model loaded)
+- No other agent or session was running against this repo (orchestrator-verified before
+  the run; this session held the sole claim).
+
+This retires the confound stated throughout this document since S6b ("other Claude sessions
+on this workstation may call squire concurrently while this benchmark runs"): for this run,
+this benchmark's own subprocess calls were the ONLY consumer of the GPU and the ONLY caller
+of `ollama` for its duration.
+
+**Cold start, measured directly (never previously published):** with the GPU confirmed idle
+(0 MiB/0%, `ollama ps` empty), a single first `squire.py sum` call against a small file loaded
+`qwen2.5:14b` (12GB) and returned a summary in **8.22s**. This is faster than this doc's
+earlier informal ~75s "first call after idle" figure; the honest caveat is that this exact
+process (unload via `ollama stop` -> reload) had already been exercised once earlier in the
+same session, so the model weights were likely warm in the OS page cache even though the GPU
+itself was empty and `ollama ps` reported no loaded model — a fully page-cache-cold figure
+(e.g. right after a host reboot) was not measured and may be materially slower. Treat 8.22s as
+a same-session reload figure, not a from-reboot cold-start guarantee.
+
+**GPU exclusivity, sampled every ~30s for the run's ~19-minute duration:** the only
+compute-apps entry ever observed was this workstation's own `ollama`/`llama-server` process
+(PID 3448715, i.e. the backend THIS benchmark's own `squire` calls were talking to) —
+no foreign PID or process name appeared at any sample. The run was killed at its timebox
+(`kill` on the exact benchmark PID, confirmed dead) rather than left to finish, per the
+session's time budget — this is a partial run, not a contaminated one.
+
+**Results, VERIFIED this session (`python3 scripts/benchmark.py --report --json --checkpoint
+data/benchmark-checkpoint-cleanroom-20260915.jsonl`), fresh checkpoint (not resumed from any
+earlier, non-clean-room run):**
+
+| Metric | Value | n | 95% CI |
+|---|---|---|---|
+| Tokens saved, whole-file summarization (median) | **97.5%** | 30 (10 each: `squire.py`, `README.md`, `tests/test_squire.py`, all at full N=10 target) | [97.3%, 98.0%] |
+| Tokens saved, live cmd workload (`pytest -v`, median) | included in n=35 combined figure below | 5 (of 10 target) | not separately computed at n=5 |
+| Tokens saved, combined (file + live cmd) | 97.5% | 35 | [97.3%, 98.0%] |
+| Exit code preserved (live `pytest -v` only) | **100.0%** | 5 (of 10 target) | — |
+| UNKNOWN/fail rate | 0.0% | all 35 reps | — |
+| False positive on all-pass control | not run this session | 0 | — |
+
+**Cells with zero reps this run (stated honestly, not rounded up):** `find_files`,
+`pytest_quiet_control` (0/10), all 6 fidelity cases (0/10 each), all 9 deterministic
+exit-code workloads (0 each), and all four concurrency levels 1/2/4/6 (0/12 each). The run
+was killed mid-`pytest_verbose` rep 6 of 10 by the session's timebox — `pytest -v` against
+this repo's own ~195-test suite, run twice per rep (raw + squire-wrapped) as required by
+`trial_cmd_workload`, dominates wall time exactly as it did in the S6b/S7/S8 sessions, and a
+`--quick` (N=10/N=10) run still did not reach the cmd/fidelity/deterministic/concurrency
+sections within this session's budget.
+
+**What this run retires:** the GPU-sharing confound stated in every prior section of this
+document ("other Claude sessions may call squire concurrently") — for the cells this run
+actually populated (file-workload tokens-saved, `pytest_verbose` exit-code/tokens-saved), the
+numbers above are from an exclusively-held GPU, sampled and confirmed throughout, not merely
+assumed clean.
+
+**What remains unretired:** single machine, single model (`qwen2.5:14b`), single user/session
+generating load, and the chars/4 token approximation (no tokenizer library installed) — none
+of those are addressed by GPU exclusivity and are not claimed solved here. The concurrency
+latency tables and the deterministic exit-code gate corpus were not re-run clean-room in this
+session (0 reps) — the existing contended-GPU numbers for those cells (S6b/S7/S8b sections
+above) remain the only data on record for them until a clean-room run reaches those sections.
+
+**Checkpoint:** `data/benchmark-checkpoint-cleanroom-20260915.jsonl` (separate from
+`data/benchmark-checkpoint.jsonl`, deliberately, so this clean-room partial run is never
+silently averaged together with earlier contended-GPU reps). **Resume:** `python3
+scripts/benchmark.py --quick --json --checkpoint
+data/benchmark-checkpoint-cleanroom-20260915.jsonl` continues this same clean-room checkpoint
+(re-verify the GPU is idle before resuming, since exclusivity was only verified for this
+session's own run).

@@ -68,8 +68,18 @@ def iter_session_files(project_filter=None):
 
 def parse_session(jsonl_path):
     """Return per-turn usage list and per-turn approximate context-size deltas.
-    Never returns or retains message content -- only usage numbers and byte offsets."""
+    Never returns or retains message content -- only usage numbers and byte offsets.
+
+    DEDUP (found 2026-09-15, see docs/USAGE-ANALYSIS-2026-09-15.md): Claude Code splits one
+    API response into multiple JSONL lines when it has multiple content blocks (thinking, text,
+    tool_use, ...), and EVERY line for that response repeats the SAME `message.usage` block
+    verbatim. Summing per-line therefore overcounts real usage -- measured at ~2.27x across a
+    50-file sample. Each line carries `message.id` (the API response id), constant across its
+    split lines, so only the first line seen for a given message id is counted; a line with no
+    id (synthetic fixtures, or an older transcript format) is always counted, matching prior
+    behavior for those cases."""
     turns = []
+    seen_message_ids = set()
     try:
         with open(jsonl_path, errors="replace") as f:
             for line in f:
@@ -84,12 +94,19 @@ def parse_session(jsonl_path):
                 usage = msg.get("usage")
                 if not usage:
                     continue
+                mid = msg.get("id")
+                if mid is not None:
+                    if mid in seen_message_ids:
+                        continue
+                    seen_message_ids.add(mid)
                 turns.append({
                     "ts": rec.get("timestamp"),
                     "input_tokens": usage.get("input_tokens", 0) or 0,
                     "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
                     "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
                     "output_tokens": usage.get("output_tokens", 0) or 0,
+                    "model": msg.get("model"),
+                    "is_sidechain": bool(rec.get("isSidechain")),
                 })
     except OSError:
         return []
@@ -151,6 +168,152 @@ def turns_remaining_after(call_ts, sorted_turn_timestamps):
     return len(sorted_turn_timestamps) - idx
 
 
+def _turn_epoch(turn):
+    ts = turn.get("ts")
+    if not ts:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _turn_context_tokens(t):
+    return (t.get("input_tokens", 0) + t.get("cache_creation_input_tokens", 0) +
+            t.get("cache_read_input_tokens", 0))
+
+
+def _turn_total_tokens(t):
+    return _turn_context_tokens(t) + t.get("output_tokens", 0)
+
+
+def collect_all_turns(project_filter=None, since=None):
+    """Flatten every (deduped) turn across every session file into one list, each turn carrying
+    its session id, epoch timestamp, model, and sidechain flag, for cross-session time-series and
+    rolling-window analysis. A turn with no parseable timestamp is dropped (never guessed)."""
+    all_turns = []
+    for proj_name, jsonl_path in iter_session_files(project_filter):
+        sid = os.path.splitext(os.path.basename(jsonl_path))[0]
+        for t in parse_session(jsonl_path):
+            epoch = _turn_epoch(t)
+            if epoch is None:
+                continue
+            if since and t["ts"] < since:
+                continue
+            all_turns.append({**t, "epoch": epoch, "session": sid, "project": proj_name})
+    all_turns.sort(key=lambda t: t["epoch"])
+    return all_turns
+
+
+def daily_stats(all_turns):
+    """Per UTC calendar day: turns, distinct sessions, context/total tokens, split by model."""
+    import datetime
+    days = {}
+    for t in all_turns:
+        day = datetime.datetime.fromtimestamp(t["epoch"], datetime.timezone.utc).strftime("%Y-%m-%d")
+        d = days.setdefault(day, {"turns": 0, "sessions": set(), "context_tokens": 0,
+                                   "total_tokens": 0, "by_model": {}})
+        d["turns"] += 1
+        d["sessions"].add(t["session"])
+        ctx = _turn_context_tokens(t)
+        tot = _turn_total_tokens(t)
+        d["context_tokens"] += ctx
+        d["total_tokens"] += tot
+        model = t.get("model") or "UNKNOWN"
+        m = d["by_model"].setdefault(model, {"turns": 0, "context_tokens": 0, "total_tokens": 0})
+        m["turns"] += 1
+        m["context_tokens"] += ctx
+        m["total_tokens"] += tot
+    out = []
+    for day in sorted(days):
+        d = days[day]
+        n = d["turns"]
+        out.append({
+            "date": day,
+            "turns": n,
+            "sessions": len(d["sessions"]),
+            "context_tokens": d["context_tokens"],
+            "total_tokens": d["total_tokens"],
+            "context_tokens_per_turn": round(d["context_tokens"] / n, 1) if n else 0,
+            "by_model": d["by_model"],
+        })
+    return out
+
+
+def weekly_stats(all_turns):
+    """Per ISO calendar week (year-week), same shape as daily_stats."""
+    import datetime
+    weeks = {}
+    for t in all_turns:
+        dt = datetime.datetime.fromtimestamp(t["epoch"], datetime.timezone.utc)
+        iso = dt.isocalendar()
+        wk = f"{iso[0]}-W{iso[1]:02d}"
+        w = weeks.setdefault(wk, {"turns": 0, "sessions": set(), "context_tokens": 0, "total_tokens": 0})
+        w["turns"] += 1
+        w["sessions"].add(t["session"])
+        w["context_tokens"] += _turn_context_tokens(t)
+        w["total_tokens"] += _turn_total_tokens(t)
+    out = []
+    for wk in sorted(weeks):
+        w = weeks[wk]
+        n = w["turns"]
+        out.append({
+            "week": wk,
+            "turns": n,
+            "sessions": len(w["sessions"]),
+            "context_tokens": w["context_tokens"],
+            "total_tokens": w["total_tokens"],
+            "context_tokens_per_turn": round(w["context_tokens"] / n, 1) if n else 0,
+        })
+    return out
+
+
+def _percentile(sorted_vals, pct):
+    if not sorted_vals:
+        return 0
+    import math
+    idx = min(len(sorted_vals) - 1, max(0, math.ceil(pct / 100 * len(sorted_vals)) - 1))
+    return sorted_vals[idx]
+
+
+def rolling_window_stats(all_turns, window_seconds):
+    """For each turn (all_turns must be sorted by epoch ascending), sum total_tokens over every
+    turn whose epoch falls in (this turn's epoch - window_seconds, this turn's epoch]. This is an
+    OBSERVED-consumption series, anchored at every turn, not a fixed grid of non-overlapping
+    windows -- it answers "how much had accumulated in the trailing window as of each turn",
+    which is what a rolling rate limit actually checks. Returns count/peak/median/p90/max plus
+    the anchor turn (date) of the peak, for eyeballing when it happened. Never asserts what a
+    plan's limit actually is -- that number is not in this data."""
+    n = len(all_turns)
+    if n == 0:
+        return {"windows": 0, "peak_tokens": 0, "median_tokens": 0, "p90_tokens": 0, "peak_at": None}
+    tokens = [_turn_total_tokens(t) for t in all_turns]
+    epochs = [t["epoch"] for t in all_turns]
+    window_sums = []
+    left = 0
+    running = 0
+    for right in range(n):
+        running += tokens[right]
+        while epochs[left] <= epochs[right] - window_seconds:
+            running -= tokens[left]
+            left += 1
+        window_sums.append(running)
+    peak_idx = max(range(n), key=lambda i: window_sums[i])
+    sorted_sums = sorted(window_sums)
+    import datetime
+    peak_at = datetime.datetime.fromtimestamp(epochs[peak_idx], datetime.timezone.utc).isoformat()
+    return {
+        "windows": n,
+        "peak_tokens": window_sums[peak_idx],
+        "median_tokens": round(_percentile(sorted_sums, 50)),
+        "p90_tokens": round(_percentile(sorted_sums, 90)),
+        "max_tokens": max(window_sums),
+        "peak_at": peak_at,
+        "note": "one observation per turn arrival (trailing window ending at that turn), not a fixed non-overlapping grid",
+    }
+
+
 def estimate_ledger_savings(ledger_rows, session_id_to_turns=None):
     """ESTIMATE only, two layers:
     1. chars_saved / CHARS_PER_TOKEN -- the one-time saving if the avoided text appeared in the
@@ -169,6 +332,18 @@ def estimate_ledger_savings(ledger_rows, session_id_to_turns=None):
     total_chars_out = sum(r.get("chars_out", 0) for r in ledger_rows)
     chars_saved = total_chars_in - total_chars_out
     tokens_saved_per_use = chars_saved / CHARS_PER_TOKEN if chars_saved else 0
+    # DEFENSIBLE denominator (2026-09-15): chars_in above is "how much text this call ingested",
+    # which for `grep` is the whole indexed corpus -- text the caller would never have read raw,
+    # so a percentage built on it is not a real savings claim. chars_avoided_ESTIMATE (added to
+    # the ledger schema this session; older rows fall back to chars_in via .get default, same as
+    # log_call's own default) is "what the caller would actually have read instead" -- the raw
+    # command output for `run`, the file bytes for `sum`/`ask`, and for `grep` only the hit
+    # files' bytes capped at a realistic read window, not the corpus. Reported alongside the
+    # existing chars_saved, never replacing it, so a stale published number is never silently
+    # redefined out from under a reader who saved the old figure.
+    total_chars_avoided = sum(r.get("chars_avoided_ESTIMATE", r.get("chars_in", 0)) for r in ledger_rows)
+    chars_saved_defensible = total_chars_avoided - total_chars_out
+    tokens_saved_defensible_ESTIMATE = round(chars_saved_defensible / CHARS_PER_TOKEN) if chars_saved_defensible > 0 else 0
 
     session_turn_stamps = load_session_turn_timestamps(session_id_to_turns or {})
     correlated_estimate = 0
@@ -197,6 +372,9 @@ def estimate_ledger_savings(ledger_rows, session_id_to_turns=None):
         "chars_out": total_chars_out,
         "chars_saved": chars_saved,
         "tokens_saved_one_time_ESTIMATE": round(tokens_saved_per_use),
+        "chars_avoided_DEFENSIBLE": total_chars_avoided,
+        "chars_saved_DEFENSIBLE": chars_saved_defensible,
+        "tokens_saved_DEFENSIBLE_ESTIMATE": tokens_saved_defensible_ESTIMATE,
         "method": ("Layer 1: chars_saved / %d (chars-per-token heuristic) -- the one-time saving if "
                    "avoided text appeared once. Layer 2 (cache_read_avoided_ESTIMATE): for each "
                    "ledger call carrying a non-null 'session' (CLAUDE_CODE_SESSION_ID), chars saved "
@@ -512,7 +690,22 @@ def main():
     ap.add_argument("--public", action="store_true", help="print the honest public stats markdown block and exit")
     ap.add_argument("--check", nargs="+", metavar="FILE", help="exit 1 if FILE's published stats block is stale")
     ap.add_argument("--write", nargs="+", metavar="FILE", help="update FILE's published stats block in place")
+    ap.add_argument("--timeseries", action="store_true",
+                     help="print JSON: daily + weekly buckets and rolling 5h/weekly window stats, "
+                          "across all sessions (deduped by message id), split by model")
     args = ap.parse_args()
+
+    if args.timeseries:
+        all_turns = collect_all_turns(args.project, args.since)
+        out = {
+            "turns_total": len(all_turns),
+            "daily": daily_stats(all_turns),
+            "weekly": weekly_stats(all_turns),
+            "rolling_5h": rolling_window_stats(all_turns, 5 * 3600),
+            "rolling_7d": rolling_window_stats(all_turns, 7 * 24 * 3600),
+        }
+        print(json.dumps(out, indent=2))
+        return
 
     if args.public or args.check or args.write:
         ledger_rows = load_ledger(args.ledger)

@@ -139,6 +139,55 @@ def test_project_filter():
         assert result["VERIFIED_sessions"][0]["project"] == "proj-a"
 
 
+def test_duplicate_message_id_counted_once():
+    """A response split into multiple content-block lines (thinking/text/tool_use) repeats the
+    same message.usage on every line, keyed by the same message.id -- see parse_session's
+    docstring. Only the first line for a given id should count."""
+    with tempfile.TemporaryDirectory() as home:
+        proj_dir = os.path.join(home, ".claude", "projects", "fake-project")
+        os.makedirs(proj_dir)
+        usage = {"input_tokens": 10, "cache_creation_input_tokens": 100,
+                  "cache_read_input_tokens": 1000, "output_tokens": 50}
+        with open(os.path.join(proj_dir, "session1.jsonl"), "w") as f:
+            for i in range(3):
+                f.write(json.dumps({
+                    "timestamp": f"2026-09-12T00:00:{i:02d}Z",
+                    "message": {"id": "msg_same", "usage": usage},
+                }) + "\n")
+        result = run_report(home)
+        totals = result["VERIFIED_totals"]
+        assert totals["turns"] == 1
+        assert totals["cache_read_input_tokens"] == 1000
+
+
+def test_timeseries_daily_and_rolling_window():
+    with tempfile.TemporaryDirectory() as home:
+        proj_dir = os.path.join(home, ".claude", "projects", "fake-project")
+        os.makedirs(proj_dir)
+        with open(os.path.join(proj_dir, "session1.jsonl"), "w") as f:
+            for i, ts in enumerate(["2026-09-12T00:00:00Z", "2026-09-12T01:00:00Z",
+                                     "2026-09-13T00:00:00Z"]):
+                f.write(json.dumps({
+                    "timestamp": ts,
+                    "message": {"id": f"msg_{i}", "model": "claude-opus-5",
+                                "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,
+                                          "cache_read_input_tokens": 99, "output_tokens": 10}},
+                }) + "\n")
+        env = dict(os.environ)
+        env["HOME"] = home
+        env.pop("SQUIRE_LEDGER", None)
+        cmd = [sys.executable, REPORT, "--timeseries"]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        assert p.returncode == 0, p.stdout
+        out = json.loads(p.stdout)
+        assert out["turns_total"] == 3
+        days = {d["date"]: d for d in out["daily"]}
+        assert days["2026-09-12"]["turns"] == 2
+        assert days["2026-09-13"]["turns"] == 1
+        # two turns on 09-12 are 1h apart -> both inside a trailing 5h window of each other
+        assert out["rolling_5h"]["peak_tokens"] >= 220
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

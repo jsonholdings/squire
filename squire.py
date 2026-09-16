@@ -16,6 +16,9 @@ vLLM), so long output is condensed locally before a session reads it.
     squire triage <file>         order a HANDOFF-INBOX/BACKLOG by real age, with a guessed impact line
     squire stats                 real chars in/out logged, plus a labelled token estimate
     squire doctor                check backend, models and GPU; exit 0 ready, 2 UNKNOWN
+    squire warmup [--wait]        opt-in: load the model into VRAM ahead of the first real call
+                                 (never automatic; backgrounds by default so it never blocks
+                                 anything; no-op if the backend is down or SQUIRE_HOOK_DISABLE=1)
     squire submit <sum|ask|draft|diff|triage> [args...]   queue a job, print its id immediately
     squire worker                 process queued jobs FIFO, one at a time (run as a service)
     squire status <id> | squire wait <id> [--timeout S]   exit 0 RESULT, 1 FAIL, 2 WAIT, 3 UNKNOWN
@@ -31,10 +34,11 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.21"
+__version__ = "0.2.29"
 
 import datetime as _dt
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -114,6 +118,22 @@ EMBED_LOCK_PATH = os.path.expanduser(os.environ.get("SQUIRE_EMBED_LOCK", os.path
 EMBED_LOCK_TIMEOUT = float(os.environ.get("SQUIRE_EMBED_LOCK_TIMEOUT", "60"))
 EMBED_HTTP_TIMEOUT = float(os.environ.get("SQUIRE_EMBED_HTTP_TIMEOUT", "60"))
 GREP_TIMEOUT = float(os.environ.get("SQUIRE_GREP_TIMEOUT", "0") or 0) or None  # 0/unset = no deadline
+# 2026-09-15, item 3 (usage-analysis finding 5): 117 of 1,018 lifetime ledger calls came back
+# UNKNOWN (~11.5%), 78% of them on one day (2026-09-13) -- but `ask`/`draft` specifically ran far
+# below sum/grep/run/diff's 95-97% ok-rate even outside that outage window. A single failed HTTP
+# call to Ollama (a dropped connection, a momentary 500, a request that lands mid-model-reload)
+# used to be reported as UNKNOWN immediately with no retry at all. Bounded retry with backoff below
+# turns a one-off transient failure into a success instead of a false UNKNOWN, while an exhausted
+# retry still returns UNKNOWN, never a fabricated answer -- this is exactly the pattern already used
+# for `_LlmLock`'s bounded wait, applied to the network call itself.
+LLM_RETRIES = int(os.environ.get("SQUIRE_LLM_RETRIES", "2"))
+LLM_RETRY_BACKOFF_S = float(os.environ.get("SQUIRE_LLM_RETRY_BACKOFF_S", "1.5"))
+# `draft`'s max_tokens (1200, vs 300 for sum/ask/triage) generates far more tokens per call, so it
+# is the likeliest of the four to hit a fixed HTTP timeout mid-generation on a slow decode. Give
+# longer generations proportionally more wall-clock room, capped so a stuck request still can't
+# block the caller indefinitely (never more than SQUIRE_LLM_TIMEOUT_MAX, default 600s).
+LLM_TIMEOUT_S = float(os.environ.get("SQUIRE_LLM_TIMEOUT", "300"))
+LLM_TIMEOUT_MAX_S = float(os.environ.get("SQUIRE_LLM_TIMEOUT_MAX", "600"))
 CHARS_PER_TOKEN = 4      # rough estimate for English text; stats labels this explicitly as an estimate
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -136,6 +156,23 @@ class BackendError(Exception):
     pass
 
 
+def _unknown_reason(msg):
+    """Pull a short, machine-usable reason out of an 'UNKNOWN: ...' sentinel (llm()'s return or a
+    BackendError's str()) for the ledger's `status` field. Before this, log_call's `status` was
+    only ever set by a handful of call sites that already had a distinct reason string on hand
+    (grep's 'timeout'/'error', run's missing-command reasons); every other failure just logged
+    backend_ok=False with no reason at all, so squire_report.py could count UNKNOWN calls but not
+    say why any of them failed. Returns None for anything that isn't an UNKNOWN sentinel."""
+    if not msg or not msg.startswith("UNKNOWN:"):
+        return None
+    m = re.search(r"\(([A-Za-z_]+):", msg)
+    if m:
+        return m.group(1)
+    if "busy" in msg:
+        return "busy"
+    return "unknown"
+
+
 def redact(text):
     for pat in SECRET_PATTERNS:
         if pat.groups >= 2:
@@ -153,7 +190,7 @@ def check_local(url):
 
 
 def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None, source=None, job=None,
-             status=None, exit_code=None, duration_s=None, passthrough=False):
+             status=None, exit_code=None, duration_s=None, passthrough=False, chars_avoided=None):
     # chars_in/out/ts are real, computed facts. The token estimate derived from them in `stats`
     # is NOT -- the two must never be presented as the same kind of claim.
     # queue_wait_s/gen_s (2026-09-13, S1) split how long a call sat waiting for the local lock
@@ -169,7 +206,16 @@ def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None
     # exit=None even though `squire run` prints the real code to the user (`[squire] exit=N`) --
     # the ledger had no way to audit it after the fact. gen_s/queue_wait_s only cover the LLM
     # summarization call, not the wrapped command, so a separate field is needed.
+    # chars_avoided_ESTIMATE (2026-09-15): a SEPARATE field from chars_in, deliberately never
+    # overwriting it. chars_in is "how much text this call ingested" -- for `grep` that is the
+    # whole indexed corpus (one real call ingested 10.9M chars), which the caller would NEVER
+    # have read raw and so is not a defensible savings denominator. chars_avoided is "what the
+    # caller would actually have read instead of this call's output" -- for run/sum/ask/diff/
+    # triage that already equals chars_in (the real raw output/file/diff text), so it defaults
+    # to chars_in when the caller doesn't pass a different counterfactual. Only `grep` passes an
+    # explicit, smaller value (see cmd_grep).
     row = {"ts": time.time(), "cmd": cmd, "chars_in": chars_in, "chars_out": chars_out,
+           "chars_avoided_ESTIMATE": chars_in if chars_avoided is None else chars_avoided,
            "backend_ok": backend_ok, "queue_wait_s": queue_wait_s, "gen_s": gen_s,
            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "source": source or SOURCE,
            "status": status, "exit_code": exit_code, "duration_s": duration_s}
@@ -369,6 +415,12 @@ def get_call_timing():
     return round(_call_timing_totals["queue_wait_s"], 2), round(_call_timing_totals["gen_s"], 2)
 
 
+def _llm_gen_timeout(max_tokens):
+    if max_tokens <= 300:
+        return LLM_TIMEOUT_S
+    return min(LLM_TIMEOUT_MAX_S, LLM_TIMEOUT_S + max_tokens)
+
+
 def llm(prompt, max_tokens=300):
     prompt = redact(prompt)
     paused_owner = gpu_paused_by()
@@ -381,23 +433,35 @@ def llm(prompt, max_tokens=300):
             # never got a turn. Fails fast instead of also burning a full HTTP timeout on top.
             return f"UNKNOWN: local model busy (queued {round(lock.wait_s, 1)}s, gave up)"[:300]
         gen_start = time.monotonic()
+        timeout = _llm_gen_timeout(max_tokens)
+        last_err = None
         try:
-            if BACKEND == "openai":
-                data = _post(OPENAI_BASE.rstrip("/") + "/chat/completions",
-                             {"model": model(), "messages": [{"role": "user", "content": prompt}],
-                              "max_tokens": max_tokens, "temperature": 0.1})
-                return data["choices"][0]["message"]["content"].strip()
-            # keep_alive holds the model in VRAM between calls: a cold load (~75s for 14B) inside a
-            # hook-wrapped test run can push the command past the caller's timeout.
-            gen_payload = {"model": model(), "prompt": prompt, "stream": False,
-                           "keep_alive": KEEP_ALIVE,
-                           "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}}
-            if THINK is not None:
-                gen_payload["think"] = THINK
-            data = _post(HOST + "/api/generate", gen_payload)
-            return data.get("response", "").strip()
-        except Exception as e:  # noqa: BLE001 - any failure is reported, never swallowed
-            return f"UNKNOWN: local model unavailable ({type(e).__name__}: {e})"[:300]
+            for attempt in range(LLM_RETRIES + 1):
+                try:
+                    if BACKEND == "openai":
+                        data = _post(OPENAI_BASE.rstrip("/") + "/chat/completions",
+                                     {"model": model(), "messages": [{"role": "user", "content": prompt}],
+                                      "max_tokens": max_tokens, "temperature": 0.1}, timeout)
+                        return data["choices"][0]["message"]["content"].strip()
+                    # keep_alive holds the model in VRAM between calls: a cold load (~75s for 14B)
+                    # inside a hook-wrapped test run can push the command past the caller's timeout.
+                    gen_payload = {"model": model(), "prompt": prompt, "stream": False,
+                                   "keep_alive": KEEP_ALIVE,
+                                   "options": {"num_ctx": CTX, "num_predict": max_tokens, "temperature": 0.1}}
+                    if THINK is not None:
+                        gen_payload["think"] = THINK
+                    data = _post(HOST + "/api/generate", gen_payload, timeout)
+                    return data.get("response", "").strip()
+                except Exception as e:  # noqa: BLE001 - any failure is reported, never swallowed
+                    last_err = e
+                    if attempt < LLM_RETRIES:
+                        time.sleep(LLM_RETRY_BACKOFF_S * (2 ** attempt))
+                        continue
+            # Retries exhausted (or SQUIRE_LLM_RETRIES=0): still never fabricate an answer, and the
+            # reason names the real exception so the ledger's status field (see _unknown_reason)
+            # can tell "timeout" apart from "connection refused" apart from a 500, etc.
+            tried = f" after {LLM_RETRIES + 1} attempts" if LLM_RETRIES else ""
+            return f"UNKNOWN: local model unavailable{tried} ({type(last_err).__name__}: {last_err})"[:300]
         finally:
             _call_timing_totals["gen_s"] += time.monotonic() - gen_start
 
@@ -492,6 +556,90 @@ def condense_verified(text, task, max_tokens=300):
     return summary, flag
 
 
+# ---------------------------------------------------------------- item 5: sum/ask cache + citations
+
+CACHE_DIR = os.path.expanduser(os.environ.get("SQUIRE_CACHE_DIR", "~/.squire/cache"))
+# Size bound: a sum/ask result is a few hundred bytes to a few KB, so 500 entries bounds the whole
+# cache to single-digit MB, not unbounded growth. Evicted least-recently-USED first (see
+# _cache_evict), not oldest-written, so a call repeated often outlives a one-off.
+CACHE_MAX_ENTRIES = int(os.environ.get("SQUIRE_CACHE_MAX_ENTRIES", "500"))
+# Invalidation rule: bump this whenever `sum`'s or `ask`'s prompt TEMPLATE changes (the fixed
+# instruction text baked into `task` below, not the input text or the question) -- a stale entry
+# cached under the OLD prompt would silently serve output the CURRENT prompt was never asked to
+# produce. cache_key() folds this into the key, so bumping it invalidates every old entry by
+# simply never matching them again; nothing is deleted, they just age out via CACHE_MAX_ENTRIES.
+PROMPT_VERSION = "v1"
+
+CITE_INSTRUCTION = ("Cite the exact source line number(s) for each claim, using the numbers shown "
+                    "at the start of each input line, formatted as [L<n>] or [L<n>-<m>].")
+
+
+def cache_key(cmd, text, task):
+    # Keyed on the EXACT input text plus model + prompt version + task (task already carries the
+    # question for `ask`, so two different questions against the same file never collide).
+    h = hashlib.sha256()
+    for part in (cmd, model(), PROMPT_VERSION, task):
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    h.update(text.encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def cache_get(key):
+    """Cached result string, or None on a miss -- including a corrupt or missing cache file. The
+    cache is a pure speed optimization; it must never be load-bearing for correctness, so any
+    failure here is silently treated as a miss and the real call proceeds."""
+    path = os.path.join(CACHE_DIR, key + ".json")
+    try:
+        with open(path) as f:
+            result = json.load(f)["result"]
+        os.utime(path, None)  # touch on hit: eviction below is LRU, not insertion-order
+        return result
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def cache_put(key, result):
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, key + ".json"), "w") as f:
+            json.dump({"result": result, "ts": time.time()}, f)
+    except OSError:
+        return
+    _cache_evict()
+
+
+def _cache_evict():
+    try:
+        names = [f for f in os.listdir(CACHE_DIR) if f.endswith(".json")]
+    except OSError:
+        return
+    if len(names) <= CACHE_MAX_ENTRIES:
+        return
+    entries = []
+    for f in names:
+        try:
+            entries.append((os.path.getmtime(os.path.join(CACHE_DIR, f)), f))
+        except OSError:
+            continue
+    entries.sort()  # oldest-touched first
+    for _, f in entries[:len(entries) - CACHE_MAX_ENTRIES]:
+        try:
+            os.remove(os.path.join(CACHE_DIR, f))
+        except OSError:
+            pass
+
+
+def add_line_numbers(text):
+    """Prefixes every line with its 1-based line number, so sum/ask can cite exactly where a
+    claim came from ([L<n>] / [L<n>-<m>]) -- verifying one becomes a two-line ranged Read instead
+    of re-reading the whole file to find it. Only used for the copy of the text sent to the model;
+    the cache key and every ledger char count still use the original, unnumbered text."""
+    lines = text.split("\n")
+    width = len(str(len(lines))) or 1
+    return "\n".join(f"{i + 1:>{width}}: {ln}" for i, ln in enumerate(lines))
+
+
 def read_input(arg):
     if arg in (None, "-"):
         return sys.stdin.read()
@@ -558,6 +706,29 @@ def cmd_run(argv):
             print(f"[squire] exit=124 lines={len(out.splitlines())} (timeout)")
         emit("run", 124, out, None, True, json_mode)
         sys.exit(124)
+    except OSError as e:
+        # The command named after "--" does not exist, is not executable, or its interpreter
+        # doesn't (e.g. a missing binary, a bad shebang). This ONLY happens on the shell=False
+        # (multi-arg) path -- shell=True already returns a real 127 from the shell itself for a
+        # missing command. Before this fix, subprocess.run raised FileNotFoundError/PermissionError
+        # here UNCAUGHT: Python printed its own traceback and exited 1, with no "[squire] exit=N"
+        # line at all -- a wrapper (e.g. the pretool_wrap hook feeding `squire run -- bash -c
+        # '<cmd>'`) could then be misread as if the command ran, since the fidelity contract
+        # ("squire always prints the real exit code") silently didn't hold for this case. Fabricate
+        # the shell-convention codes (127 = command not found, 126 = found but not executable) so
+        # this failure mode is never confused with success and always has a visible, real,
+        # non-zero code -- VERIFIED never 0.
+        missing = argv[0] if argv else "?"
+        code = 126 if isinstance(e, PermissionError) else 127
+        reason = "permission denied" if code == 126 else "command not found"
+        out = f"squire: {reason}: {missing} ({e})\n"
+        if not json_mode:
+            print(f"[squire] exit={code} lines=1 ({reason})")
+        log_call("run", len(out), len(out), True, exit_code=code,
+                 duration_s=round(time.monotonic() - run_start, 2), passthrough=True,
+                 status=reason)
+        emit("run", code, out, None, True, json_mode)
+        sys.exit(code)
     out = p.stdout or ""
     lines = out.splitlines()
     if not json_mode:
@@ -576,7 +747,8 @@ def cmd_run(argv):
         ok = not summary.startswith("UNKNOWN:")
         wait_s, gen_s = get_call_timing()
         log_call("run", len(out), len(summary), ok, wait_s, gen_s,
-                  exit_code=p.returncode, duration_s=round(time.monotonic() - run_start, 2))
+                  exit_code=p.returncode, duration_s=round(time.monotonic() - run_start, 2),
+                  status=None if ok else _unknown_reason(summary))
         emit("run", p.returncode, "\n".join(lines[-TAIL:]), summary, ok, json_mode, flag)
     sys.exit(p.returncode)
 
@@ -604,7 +776,8 @@ def cmd_diff(argv):
                                       "from formatting/rename-only changes. Be factual, keep exact file paths and names.")
     ok = not summary.startswith("UNKNOWN:")
     wait_s, gen_s = get_call_timing()
-    log_call("diff", len(diff_text), len(summary), ok, wait_s, gen_s)
+    log_call("diff", len(diff_text), len(summary), ok, wait_s, gen_s,
+              status=None if ok else _unknown_reason(summary))
     if not json_mode:
         print(f"[squire] {stat.splitlines()[-1] if stat else '(no stat)'}")
     emit("diff", 0, stat, summary, ok, json_mode, flag)
@@ -616,6 +789,58 @@ GREP_WINDOW, GREP_OVERLAP, GREP_BATCH = 40, 10, 32
 GREP_MAX_BYTES = 1_000_000
 GREP_SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".squire-cache", "dist", "build", ".tox", ".mypy_cache", ".pytest_cache"}
 GREP_SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".gz", ".tar", ".pyc", ".so", ".bin", ".woff", ".woff2", ".ico", ".mp3", ".mp4", ".sqlite", ".db", ".pyz", ".lock"}
+
+
+# item 6, 2026-09-15: `squire grep`'s own output says "ranking is ASSUMED (semantic similarity)"
+# -- a real embedding model can genuinely miss a term that's in the file verbatim (wrong context,
+# an under-trained token, a too-aggressive top-N cutoff). Absence of a semantic hit is not evidence
+# of absence (the same rule ~/.claude/CLAUDE.md section 17 states for a session's own claims,
+# expressed here in code): a caller who sees zero semantic results has no way to tell "genuinely
+# not in the codebase" from "the embedding missed it" unless something PROVABLE is checked too.
+# LITERAL_STOPWORDS keeps the exact search from wasting its budget on words too common to be
+# distinctive (a hit on "the" tells a caller nothing); the query is still searched whole via the
+# semantic path above regardless of what this filters out.
+LITERAL_STOPWORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "for",
+                      "and", "or", "with", "that", "this", "how", "what", "where", "when", "why",
+                      "does", "do", "did", "not", "it", "be", "by", "as", "from", "at"}
+LITERAL_MAX_HITS = 20
+
+
+def literal_terms(query):
+    """Distinctive terms from a grep query for the literal search: alnum/path-shaped words of 3+
+    chars, stopwords dropped, de-duplicated case-insensitively, in first-seen order."""
+    words = re.findall(r"[A-Za-z0-9_./-]{3,}", query)
+    seen, terms = set(), []
+    for w in words:
+        lw = w.lower()
+        if lw in LITERAL_STOPWORDS or lw in seen:
+            continue
+        seen.add(lw)
+        terms.append(w)
+    return terms
+
+
+def literal_search(root, files, terms, max_hits=LITERAL_MAX_HITS):
+    """Exact, case-insensitive substring search for `terms` across the same file list `squire
+    grep` already indexed -- no embeddings, no ranking, just: is this text really there. Reported
+    ALONGSIDE the semantic results, never instead of them, so a caller can see when the two
+    disagree (a real term present in the literal pass but absent from the top semantic hits is
+    exactly the failure mode this guards against)."""
+    hits = []
+    if not terms:
+        return hits
+    pats = [re.compile(re.escape(t), re.I) for t in terms]
+    for rel, _mtime, _size in files:
+        try:
+            with open(os.path.join(root, rel), errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if any(p.search(line) for p in pats):
+                        hits.append({"file": rel, "line": lineno, "snippet": line.strip()[:120]})
+                        if len(hits) >= max_hits:
+                            return hits
+        except OSError:
+            continue
+    return hits
 
 
 def repo_root(path):
@@ -775,11 +1000,19 @@ def cmd_grep(argv):
         fail_status = "timeout" if "timeout" in str(e).lower() else "error"
         log_call("grep", sum(f[2] for f in files), 0, False, gen_s=grep_dur, status=fail_status)
         header.update(error=f"UNKNOWN: embedding backend unavailable ({e}); try `ollama pull {EMBED_MODEL}`")
+        # Semantic ranking is down, but the literal pass needs no model at all -- still run it so
+        # a broken embedding backend doesn't ALSO take away the one thing that can prove absence.
+        terms = literal_terms(query)
+        literal_hits = literal_search(root, files, terms)
         if json_mode:
-            print(json.dumps({"cmd": "grep", **header, "results": None, "backend_ok": False}))
+            print(json.dumps({"cmd": "grep", **header, "results": None, "backend_ok": False,
+                              "literal_terms": terms, "literal_hits": literal_hits}))
         else:
             print(f"[squire] grep indexed {len(files)} files under {root}")
             print(f"[squire] {header['error']}")
+            print(f"[squire] literal (exact, no model) matches for {terms}: {len(literal_hits)} hits")
+            for h in literal_hits:
+                print(f"{h['file']}:{h['line']}  {h['snippet']}")
         sys.exit(2)
     if not partial:
         header["reembedded_chunks"] = len(todo)
@@ -802,16 +1035,37 @@ def cmd_grep(argv):
         snippet = next((ln.strip() for ln in lines if ln.strip()), "")[:120]
         results.append({"file": rel, "line": s, "end": e, "score": round(score, 3), "snippet": snippet})
     grep_dur = round(time.monotonic() - grep_t0, 1)
+    # chars_avoided_ESTIMATE for grep: NOT the whole indexed corpus (chars_in above, kept
+    # unchanged for backward compatibility) -- a caller who didn't have `squire grep` would not
+    # have read every indexed file, only opened the files that actually turned up as hits. Model
+    # that as: each DISTINCT hit file, capped at a realistic single-look read window rather than
+    # its full size (2026-09-15, item 2 of the usage-analysis fix list -- "the bytes of the hits
+    # actually returned plus a realistic read window, NOT the whole indexed corpus").
+    REALISTIC_READ_WINDOW_CHARS = 4000  # ~1000 tokens: one ranged Read/grep-context look, not a whole file
+    sizes = {f[0]: f[2] for f in files}
+    chars_avoided = sum(min(sizes.get(r["file"], 0), REALISTIC_READ_WINDOW_CHARS) for r in {r["file"]: r for r in results}.values())
+    # item 6: an exact, no-model literal search for the query's distinctive terms, run and
+    # reported ALONGSIDE the semantic ranking above -- never a replacement for it, so a caller
+    # gets both a ranked-by-meaning view and a provable "is this text really there or not" view.
+    # A zero on BOTH is what makes "not present" defensible instead of ASSUMED from ranking alone.
+    literal_query_terms = literal_terms(query)
+    literal_hits = literal_search(root, files, literal_query_terms)
     log_call("grep", sum(f[2] for f in files), len(json.dumps(results)), qv is not None,
+             chars_avoided=chars_avoided,
              gen_s=grep_dur, status="partial" if partial else None)
     if json_mode:
-        print(json.dumps({"cmd": "grep", **header, "results": results, "backend_ok": qv is not None, "assumed": True}))
+        print(json.dumps({"cmd": "grep", **header, "results": results, "backend_ok": qv is not None, "assumed": True,
+                          "literal_terms": literal_query_terms, "literal_hits": literal_hits}))
         return
     note = " -- PARTIAL: timed out before all chunks re-embedded, showing best hits so far" if partial else ""
     print(f"[squire] grep indexed {len(files)} files under {root} ({header.get('reembedded_chunks', 0)} chunks "
           f"re-embedded{note}); ranking is ASSUMED (semantic similarity), verify before relying on it")
     for r in results:
         print(f"{r['file']}:{r['line']}  ({r['score']})  {r['snippet']}")
+    print(f"[squire] literal (exact, no model) matches for {literal_query_terms}: {len(literal_hits)} hits"
+          + (" -- semantic AND literal both zero, absence is provable" if not results and not literal_hits else ""))
+    for h in literal_hits:
+        print(f"{h['file']}:{h['line']}  {h['snippet']}")
 
 
 # ---------------------------------------------------------------- triage
@@ -866,11 +1120,12 @@ def compute_triage(text):
                 if m:
                     guesses[int(m.group(1)) - 1] = m.group(2).strip()
         backend_ok = not raw.startswith("UNKNOWN:")
+        reason = None if backend_ok else _unknown_reason(raw)
     else:
-        backend_ok = True
+        backend_ok, reason = True, None
     for n, i in enumerate(items):
         i["guess"] = guesses.get(n) if backend_ok else None
-    return items, backend_ok
+    return items, backend_ok, reason
 
 
 def cmd_triage(argv):
@@ -879,9 +1134,10 @@ def cmd_triage(argv):
         sys.exit("usage: squire triage <file> [--json]")
     text = read_input(argv[0])
     reset_call_timing()
-    items, backend_ok = compute_triage(text)
+    items, backend_ok, reason = compute_triage(text)
     wait_s, gen_s = get_call_timing()
-    log_call("triage", len(text), sum(len(i.get("guess") or "") for i in items), backend_ok, wait_s, gen_s)
+    log_call("triage", len(text), sum(len(i.get("guess") or "") for i in items), backend_ok, wait_s, gen_s,
+              status=reason)
     if json_mode:
         print(json.dumps({"cmd": "triage", "open_items": [{k: v for k, v in i.items() if k != "body"} for i in items],
                           "backend_ok": backend_ok, "assumed_fields": ["guess"]}))
@@ -1014,7 +1270,7 @@ def _run_queued_job(row):
     elif cmd == "draft":
         out = llm(f"{args[0]}\n\nSource material (may be empty):\n{text[:CHUNK]}", 1200)
     elif cmd == "triage":
-        items, backend_ok = compute_triage(text)
+        items, backend_ok, _reason = compute_triage(text)
         out = ("UNKNOWN: local model unavailable" if not backend_ok else
                "\n".join(f"[AGE: {i['age_days']}d] [{i['status']}] {i['heading']}"
                         + (f"\n    squire: {i['guess']}" if i['guess'] else "") for i in items))
@@ -1254,6 +1510,61 @@ def cmd_stats(argv):
           "re-reads context, so real savings are larger. Use scripts/squire_report.py for the measured view)")
 
 
+def _warmup_result(json_mode, ok, reason, duration_s=None):
+    if json_mode:
+        print(json.dumps({"cmd": "warmup", "ok": ok, "reason": reason, "duration_s": duration_s}))
+    elif ok:
+        print(f"[squire] warmup OK in {duration_s}s (model {model()} now resident, keep_alive={KEEP_ALIVE})")
+    else:
+        print(f"[squire] warmup skipped: {reason}")
+
+
+def cmd_warmup(argv):
+    """Opt-in warm start (item 4, 2026-09-15 usage-analysis): a cold Ollama load costs ~75s
+    (docs/BENCHMARK.md); paying that on the FIRST real sum/ask/draft/grep call of a session makes
+    that call look like squire is slow, when it's really a one-time model-load cost. `squire
+    warmup` is never called automatically -- a session/hook opts in by invoking it explicitly
+    (e.g. at session start).
+
+    Default behavior backgrounds the actual work in a detached child process and returns
+    immediately, so THIS invocation can never add latency anywhere -- the whole point is to move
+    the 75s cost earlier and off the critical path, not to make some other command wait for it.
+    `--wait` runs synchronously (used internally by the backgrounded child, or directly when a
+    caller genuinely wants to block until the model is confirmed resident, e.g. in a test).
+
+    Two hard requirements: never touch the network when SQUIRE_HOOK_DISABLE=1 (checked before
+    anything else, so this is a true silent no-op, matching the three PreToolUse hooks' own kill
+    switch); and never attempt to load a model when the backend is down (checked with a cheap
+    `installed_models()` call BEFORE the actual warm-up generate call, so a down backend fails in
+    well under a second instead of waiting through llm()'s own retry/backoff for nothing)."""
+    json_mode, argv = pop_flag(argv, "--json")
+    wait, argv = pop_flag(argv, "--wait")
+    if os.environ.get("SQUIRE_HOOK_DISABLE") == "1":
+        return  # silent no-op: hooks are off, so warmup makes no network call on this session's behalf
+    if not wait:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "warmup", "--wait"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        if json_mode:
+            print(json.dumps({"cmd": "warmup", "backgrounded": True}))
+        else:
+            print("[squire] warmup started in the background")
+        return
+    try:
+        installed_models()
+    except Exception as e:  # noqa: BLE001 - backend down; never try to load a model in this state
+        _warmup_result(json_mode, False, f"backend unreachable ({type(e).__name__}: {e})")
+        return
+    paused = gpu_paused_by()
+    if paused:
+        _warmup_result(json_mode, False, f"GPU in use by {paused}")
+        return
+    t0 = time.monotonic()
+    out = llm("Reply with the single word OK.", 5)
+    ok = not out.startswith("UNKNOWN:")
+    _warmup_result(json_mode, ok, None if ok else out, round(time.monotonic() - t0, 1))
+
+
 def cmd_doctor(argv):
     json_mode, _ = pop_flag(argv, "--json")
     report = {"cmd": "doctor", "version": __version__, "backend": BACKEND,
@@ -1301,19 +1612,22 @@ def main():
     if cmd == "run":
         return cmd_run(rest)
     handlers = {"diff": cmd_diff, "grep": cmd_grep, "triage": cmd_triage, "stats": cmd_stats, "doctor": cmd_doctor,
-                "submit": cmd_submit, "worker": cmd_worker, "status": cmd_status, "wait": cmd_wait, "jobs": cmd_jobs}
+                "submit": cmd_submit, "worker": cmd_worker, "status": cmd_status, "wait": cmd_wait, "jobs": cmd_jobs,
+                "warmup": cmd_warmup}
     if cmd in handlers:
         return handlers[cmd](rest)
     json_mode, rest = pop_flag(rest, "--json")
     reset_call_timing()
+    task = None  # non-None for sum/ask: marks them cacheable and citation-instructed; draft isn't
     if cmd == "sum":
         text = read_input(rest[0] if rest else None)
-        out = condense(text, "Condense to at most 8 factual bullets. Keep numbers, names, paths exact.")
+        task = f"Condense to at most 8 factual bullets. Keep numbers, names, paths exact. {CITE_INSTRUCTION}"
     elif cmd == "ask":
         if not rest:
             sys.exit('usage: squire ask "question" [file|-] [--json]')
         text = read_input(rest[1] if len(rest) > 1 else None)
-        out = condense(text, f"Answer using ONLY this text; say UNKNOWN if it is not there. Question: {rest[0]}")
+        task = (f"Answer using ONLY this text; say UNKNOWN if it is not there. {CITE_INSTRUCTION} "
+                f"Question: {rest[0]}")
     elif cmd == "draft":
         if not rest:
             sys.exit('usage: squire draft "instructions" [file|-] [--json]')
@@ -1321,12 +1635,23 @@ def main():
         out = llm(f"{rest[0]}\n\nSource material (may be empty):\n{text[:CHUNK]}", 1200)
     else:
         sys.exit(f"unknown command {cmd!r}; see squire --help")
+    cache_hit = False
+    if task is not None:
+        key = cache_key(cmd, text, task)
+        cached = cache_get(key)
+        if cached is not None:
+            out, cache_hit = cached, True
+        else:
+            out = condense(add_line_numbers(text), task)
+            if not out.startswith("UNKNOWN:"):
+                cache_put(key, out)
     ok = not out.startswith("UNKNOWN:")
     wait_s, gen_s = get_call_timing()
-    log_call(cmd, len(text), len(out), ok, wait_s, gen_s)
+    log_call(cmd, len(text), len(out), ok, wait_s, gen_s,
+              status="cached" if cache_hit else (None if ok else _unknown_reason(out)))
     if json_mode:
         print(json.dumps({"cmd": cmd, "exit_code": None, "raw_tail": None, "summary": out,
-                          "assumed": True, "backend_ok": ok, "verify_flag": None}))
+                          "assumed": True, "backend_ok": ok, "verify_flag": None, "cache_hit": cache_hit}))
     else:
         # `ask`'s own prompt tells the model to answer the bare word "UNKNOWN" when the text
         # genuinely doesn't contain the answer -- a healthy backend giving a real answer, not a

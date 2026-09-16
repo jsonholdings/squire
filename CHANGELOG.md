@@ -4,6 +4,115 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.29] - 2026-09-15
+### Added
+- `squire grep` now runs an exact, case-insensitive literal search for the query's distinctive
+  terms alongside the existing semantic ranking (item 6), and reports both sets. Semantic ranking
+  alone was labelled "ASSUMED", and a real embedding model can genuinely miss a term that's in a
+  file verbatim -- a zero-hit semantic result read as "not present" when it may only mean "the
+  embedding missed it". The literal pass needs no model at all, so it still runs (and is reported)
+  even when the embedding backend is down. `--json` gains `literal_terms`/`literal_hits`; text mode
+  prints a "literal (exact, no model) matches" line and, when both sets are empty, says so is
+  provable absence rather than an assumption.
+
+## [0.2.28] - 2026-09-15
+### Added
+- `sum`/`ask` results are now cached on disk (`SQUIRE_CACHE_DIR`, default `~/.squire/cache`),
+  keyed by a hash of the exact input text plus the resolved model, the prompt template, and a
+  `PROMPT_VERSION` string (item 5). An identical repeat call costs nothing: no model call, no
+  ledger `gen_s`/`queue_wait_s`, logged with `status: "cached"` so it stays visible without being
+  counted as a fresh backend call. Size-bounded to `SQUIRE_CACHE_MAX_ENTRIES` (default 500,
+  a few hundred bytes to a few KB per entry -> single-digit MB total), evicted
+  least-recently-used first. Invalidation rule: bump `PROMPT_VERSION` whenever `sum`'s or `ask`'s
+  fixed instruction text changes -- old entries simply stop matching and age out, nothing is
+  deleted outright.
+- `sum`/`ask` now cite exact source line numbers for every claim (`[L<n>]` / `[L<n>-<m>]`): the
+  model-facing copy of the input is line-numbered (`add_line_numbers()`) and the prompt instructs
+  it to cite those numbers, so verifying a claim is a two-line ranged Read instead of re-reading
+  the whole file to find where it came from.
+
+## [0.2.27] - 2026-09-15
+### Added
+- `squire warmup [--wait]`: opt-in warm start (item 4). Never runs automatically -- a session or
+  hook calls it explicitly, e.g. at session start -- so the first real `sum`/`ask`/`draft`/`grep`
+  call doesn't pay Ollama's ~75s cold-load penalty. Backgrounds the actual work in a detached
+  child process by default and returns immediately, so it can never add latency to anything;
+  `--wait` runs synchronously. Silent no-op under `SQUIRE_HOOK_DISABLE=1` (checked before any
+  network touch), and never attempts to load a model when the backend is down (a cheap
+  `installed_models()` check first, distinct from `llm()`'s own retry/backoff).
+
+## [0.2.26] - 2026-09-15
+### Added
+- `llm()` now retries a failed backend call with exponential backoff (`SQUIRE_LLM_RETRIES`,
+  default 2 extra attempts; `SQUIRE_LLM_RETRY_BACKOFF_S`, default 1.5s base) before giving up.
+  A transient failure (dropped connection, momentary 500, a request that lands mid-model-reload)
+  now has a chance to succeed instead of being reported UNKNOWN on the first hiccup. An exhausted
+  retry still returns UNKNOWN -- never a fabricated answer. Longer generations (e.g. `draft`'s
+  1200-token budget vs. 300 for sum/ask/triage) get a proportionally longer HTTP timeout, capped
+  at `SQUIRE_LLM_TIMEOUT_MAX` (default 600s) so a stuck request still can't block indefinitely.
+- Ledger `status`/`reason` field extended to every model-backed command (`run`, `diff`, `sum`,
+  `ask`, `draft`, `triage`) via a new `_unknown_reason()` helper that reads the exception name out
+  of the "UNKNOWN: ... (ExceptionType: msg)" sentinel. Before this only `grep`/`run`'s
+  missing-command path carried a reason; every other UNKNOWN call logged `backend_ok: false` with
+  no way to tell a timeout apart from a connection refusal after the fact.
+- Analysis (usage-analysis 2026-09-15, finding 5): lifetime non-test, non-passthrough ok-rate by
+  command -- `ask` 62.4% (93/149), `draft` 85.6% (243/284), vs. 94-100% for sum/run/diff/grep/
+  triage. 78% of the 117 UNKNOWN calls behind that fall on one day (2026-09-13); only 5 ledger
+  rows ever carry an explicit `timeout` status, and `ask` failures since 09-14 (22/39 UNKNOWN,
+  gen_s 0.3-70s, well under any timeout) show the model returning a fast genuine backend error,
+  not a slow timeout -- so the fix here is the retry/reason mechanism above, not a longer
+  deadline. A true before/after ok-rate needs new production calls to accumulate under this
+  change; today's ledger predates it.
+
+## [0.2.25] - 2026-09-15
+### Added
+- Ledger schema gains `chars_avoided_ESTIMATE`, a field separate from the existing `chars_in`
+  and never redefining it. `chars_in` is "how much text this call ingested"; for `grep` that
+  was the whole indexed corpus (one real call ingested 10.9M chars), which a caller would never
+  have read raw and so is not a defensible savings denominator. `chars_avoided_ESTIMATE` is
+  "what the caller would actually have read instead" -- defaults to `chars_in` for `run`/`sum`/
+  `ask`/`diff`/`triage` (already the real raw output/file/diff text, a defensible counterfactual
+  on its own), and for `grep` is computed as only the DISTINCT hit files actually returned, each
+  capped at a realistic 4000-char read window, never the full indexed corpus.
+- `scripts/squire_report.py`'s `estimate_ledger_savings`: `chars_avoided_DEFENSIBLE`,
+  `chars_saved_DEFENSIBLE`, `tokens_saved_DEFENSIBLE_ESTIMATE` alongside the existing
+  `chars_saved`/`tokens_saved_one_time_ESTIMATE` fields (kept, not replaced).
+
+## [0.2.24] - 2026-09-15
+### Fixed
+- `squire run` no longer crashes with a bare Python traceback (exit=1, no `[squire] exit=`
+  line at all) when the command named after `--` does not exist or is not executable in
+  multi-arg (shell=False) form. It now catches the OSError and always prints a real,
+  non-zero, visible exit code (127 command-not-found / 126 permission-denied), matching
+  the shell=True (single-arg) path's existing behavior. Before this fix a caller or a
+  wrapper feeding `squire run -- bash -c '<cmd>'` could misread the missing "[squire]
+  exit=" line as if the command had run and produced no output, rather than never having
+  run at all.
+
+## [0.2.23] - 2026-09-15
+### Added
+- `docs/BENCHMARK.md`: a clean-room benchmark run with the RTX 3090 confirmed exclusively
+  idle (0 MiB/0% util, no compute processes, `ollama ps` empty) before and monitored
+  throughout, retiring the shared-GPU confound stated in every prior section for the cells
+  it covers (file-workload tokens-saved, live `pytest -v` exit-code/tokens-saved). Also
+  measured, for the first time, an explicit cold-start figure (8.22s) for the first
+  model-backed call after an idle unload. Partial coverage (killed at its timebox mid
+  `pytest_verbose`): fidelity, deterministic exit-code, and concurrency-latency cells were
+  not re-run clean-room this session and remain on the existing contended-GPU numbers.
+
+## [0.2.22] - 2026-09-15
+### Added
+- `squire_report.py --timeseries`: daily and calendar-week token buckets, split by model, plus
+  rolling 5-hour and 7-day observed-usage window stats (peak/median/p90), across all Claude Code
+  session transcripts. Internal analysis tooling; see `docs/USAGE-ANALYSIS-2026-09-15.md`.
+
+### Fixed
+- `squire_report.py`'s session parser counted every JSONL line carrying a `message.usage` block,
+  but Claude Code repeats the identical usage block on every content-block line of a single API
+  response (thinking/text/tool_use split into separate lines sharing one `message.id`). This
+  overcounted total tokens by roughly 2.27x in a sampled check. Turns are now deduplicated by
+  `message.id` when present; synthetic single-usage-per-line fixtures (no id) are unaffected.
+
 ## [0.2.21] - 2026-09-15
 ### Added
 - `SQUIRE_THINK` env var: when set, adds Ollama's `think` field to `/api/generate` calls
