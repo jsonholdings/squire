@@ -62,7 +62,7 @@ its own `timeout` at the session's 45-minute cap, resuming from checkpoint each 
 GPU was otherwise free per `squire doctor`, but other sessions' subagents were
 visibly active in the shared task directory during the run, per the confound above).
 
-**Solo (N=10 each), VERIFIED this session** — `python3.13 scripts/benchmark.py --report --json`:
+**Solo (N=10 each), measured** — `python3.13 scripts/benchmark.py --report --json`:
 
 | Metric | Value | n | 95% CI |
 |---|---|---|---|
@@ -258,7 +258,7 @@ no-network, no-shared-lock corpus:
   and `print_summary` output — they measure realistic noisy-command token savings, never
   gate-grade exit-code fidelity.
 
-**Result, VERIFIED this session (`python3.13 scripts/benchmark.py --report --json`):**
+**Result, measured (`python3.13 scripts/benchmark.py --report --json`):**
 
 | Metric | Value | n |
 |---|---|---|
@@ -360,7 +360,7 @@ duration, so staleness now only means the worker process is actually gone or hun
 Reproduced pre-fix (debug harness, direct call): `squire sum squire.py` through the queue
 returned `state: UNKNOWN` at `seconds: 16.18`. Post-fix, the same call: `state: RESULT` at
 `seconds: 20.19`. Existing suite unaffected: `python3.13 -m pytest -q` → **120 passed**
-(verified this session, `squire run --`). No existing test exercised a job running past the
+(confirmed via `squire run --`). No existing test exercised a job running past the
 old 15s window, so nothing masked this before.
 
 **SUPERSEDED by S13 below.** The table that stood here compared sync numbers from an
@@ -473,7 +473,7 @@ no foreign PID or process name appeared at any sample. The run was killed at its
 (`kill` on the exact benchmark PID, confirmed dead) rather than left to finish, per the
 session's time budget — this is a partial run, not a contaminated one.
 
-**Results, VERIFIED this session (`python3 scripts/benchmark.py --report --json --checkpoint
+**Results, measured (`python3 scripts/benchmark.py --report --json --checkpoint
 data/benchmark-checkpoint-cleanroom-20260915.jsonl`), fresh checkpoint (not resumed from any
 earlier, non-clean-room run):**
 
@@ -484,7 +484,7 @@ earlier, non-clean-room run):**
 | Tokens saved, combined (file + live cmd) | 97.5% | 35 | [97.3%, 98.0%] |
 | Exit code preserved (live `pytest -v` only) | **100.0%** | 5 (of 10 target) | — |
 | UNKNOWN/fail rate | 0.0% | all 35 reps | — |
-| False positive on all-pass control | not run this session | 0 | — |
+| False positive on all-pass control | not run in this pass | 0 | — |
 
 **Cells with zero reps this run (stated honestly, not rounded up):** `find_files`,
 `pytest_quiet_control` (0/10), all 6 fidelity cases (0/10 each), all 9 deterministic
@@ -493,7 +493,7 @@ was killed mid-`pytest_verbose` rep 6 of 10 by the session's timebox — `pytest
 this repo's own ~195-test suite, run twice per rep (raw + squire-wrapped) as required by
 `trial_cmd_workload`, dominates wall time exactly as it did in the S6b/S7/S8 sessions, and a
 `--quick` (N=10/N=10) run still did not reach the cmd/fidelity/deterministic/concurrency
-sections within this session's budget.
+sections within the run's time budget.
 
 **What this run retires:** the GPU-sharing confound stated in every prior section of this
 document ("other Claude sessions may call squire concurrently") — for the cells this run

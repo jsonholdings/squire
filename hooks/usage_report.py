@@ -133,6 +133,55 @@ def per_session_table(rows, override_rows, session_filter=None):
     }
 
 
+def per_agent_table(rows, override_rows, session_filter=None):
+    """Per-agent breakdown (2026-09-18, TODO "squire usage report can't attribute per agent"):
+    every ledger row shared the SAME session_id across a session's main thread and all its
+    subagents, so "which agent skipped squire" was unanswerable from this report. Rows now carry
+    `agent_id`/`agent_type` when squire ran inside a subagent (see squire.py log_call() and
+    hooks/pretool_wrap.py build_wrapped_command()); a row with no agent_id is the main thread,
+    grouped under the literal key "main" here (never conflated with "not recorded" -- callers
+    reading the raw ledger still see agent_id: null, this label is a report-layer convenience).
+    Keyed by (session, agent_id) since agent_id alone is not guaranteed unique across sessions.
+    """
+    agents = collections.defaultdict(
+        lambda: {"agent_type": None, "by_cmd": collections.Counter(), "raw_overrides": 0}
+    )
+
+    def key_for(row):
+        sid = row.get("session") or "unknown"
+        if session_filter and sid != session_filter:
+            return None
+        aid = row.get("agent_id") or "main"
+        return (sid, aid)
+
+    for r in rows:
+        if is_fixture_row(r):
+            continue
+        k = key_for(r)
+        if k is None:
+            continue
+        entry = agents[k]
+        entry["by_cmd"][r.get("cmd", "unknown")] += 1
+        if r.get("agent_type"):
+            entry["agent_type"] = r.get("agent_type")
+    for r in override_rows:
+        k = key_for(r)
+        if k is None:
+            continue
+        entry = agents[k]
+        entry["raw_overrides"] += 1
+        if r.get("agent_type"):
+            entry["agent_type"] = r.get("agent_type")
+
+    return {
+        f"{sid}/{aid}": {
+            "session": sid, "agent_id": aid, "agent_type": v["agent_type"],
+            "by_cmd": dict(v["by_cmd"]), "raw_overrides": v["raw_overrides"],
+        }
+        for (sid, aid), v in agents.items()
+    }
+
+
 def format_text(summary, label):
     lines = [f"squire usage ({label}): {summary['total_calls']} calls, "
              f"ok-rate={summary['ok_rate']}, chars_saved={summary['chars_saved']}, "
@@ -152,6 +201,19 @@ def format_sessions_text(sessions):
     return "\n".join(lines)
 
 
+def format_agents_text(agents):
+    lines = ["per-agent:"]
+    for k, v in sorted(agents.items()):
+        calls = sum(v["by_cmd"].values())
+        label = v["agent_type"] or ("main thread" if v["agent_id"] == "main" else "unknown type")
+        lines.append(
+            f"  {k} ({label}): {calls} squire calls, {v['raw_overrides']} raw overrides"
+        )
+        for cmd, n in sorted(v["by_cmd"].items()):
+            lines.append(f"    {cmd}: {n}")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ledger", default=DEFAULT_LEDGER)
@@ -159,17 +221,21 @@ def main():
     ap.add_argument("--session", default=None, help="filter to one session id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-sessions", action="store_true", help="skip per-session table")
+    ap.add_argument("--agents", action="store_true", help="add a per-agent breakdown table")
     args = ap.parse_args()
 
     rows = load_jsonl(args.ledger)
     override_rows = load_jsonl(args.overrides)
     summary = summarize(rows, session_filter=args.session)
     sessions = {} if args.no_sessions else per_session_table(rows, override_rows, session_filter=args.session)
+    agents = per_agent_table(rows, override_rows, session_filter=args.session) if args.agents else {}
 
     if args.json:
         out = dict(summary)
         if not args.no_sessions:
             out["sessions"] = sessions
+        if args.agents:
+            out["agents"] = agents
         print(json.dumps(out, indent=2))
     else:
         label = args.session or "all sessions in ledger"
@@ -177,6 +243,9 @@ def main():
         if not args.no_sessions and sessions:
             print()
             print(format_sessions_text(sessions))
+        if args.agents and agents:
+            print()
+            print(format_agents_text(agents))
     return 0
 
 

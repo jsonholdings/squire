@@ -33,3 +33,10 @@ os.environ.setdefault("SQUIRE_LLM_RETRIES", "0")
 _tmp_cache = tempfile.mkdtemp(prefix="squire-test-cache-")
 atexit.register(lambda: __import__("shutil").rmtree(_tmp_cache, ignore_errors=True))
 os.environ.setdefault("SQUIRE_CACHE_DIR", _tmp_cache)
+
+# 2026-09-18: a real pause flag (~/.squire/gpu-paused.json, set while the owner holds the GPU)
+# made 9 tests fail because in-process and subprocess squire calls read the live flag. Point
+# every test at a path that does not exist; the pause tests set their own flag via monkeypatch.
+_tmp_flag_dir = tempfile.mkdtemp(prefix="squire-test-flag-")
+atexit.register(lambda: __import__("shutil").rmtree(_tmp_flag_dir, ignore_errors=True))
+os.environ["SQUIRE_GPU_PAUSE_FLAG"] = os.path.join(_tmp_flag_dir, "gpu-paused.json")

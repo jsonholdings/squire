@@ -39,7 +39,7 @@ import time
 
 NOISY_PROGRAMS = {
     "pytest", "jest", "vitest", "make", "mvn", "tox", "ruff", "mypy", "eslint", "tsc",
-    "ssh", "flatpak-spawn", "curl", "journalctl", "dmesg", "docker",
+    "ssh", "flatpak-spawn", "curl", "journalctl", "dmesg", "docker", "scp", "php", "phpunit",
 }
 NEVER_WRAP_PROGRAMS = {"git", "session-claim", "cat", "sed", "grep", "ls", "squire"}
 PIPE_TRIM_PROGRAMS = {"head", "tail", "grep"}
@@ -88,7 +88,23 @@ def tokenize_pipeline(command):
     return segments
 
 
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_assignments(argv):
+    """A segment like `FOO=1 BAR=x pytest -q` tokenizes to argv[0] == "FOO=1", so a naive
+    program_name(argv) never sees `pytest`. Skip leading NAME=value env-prefix words (2026-09-18
+    fix, TODO "squire pretool_wrap misses commands after a VAR= assignment") so the REAL command
+    word is what gets checked against NOISY_PROGRAMS/NEVER_WRAP_PROGRAMS. A segment that is
+    ONLY assignments (e.g. `D=$PWD/approvals` as its own `;`-separated segment) returns []."""
+    i = 0
+    while i < len(argv) and ASSIGNMENT_RE.match(argv[i]):
+        i += 1
+    return argv[i:]
+
+
 def program_name(argv):
+    argv = strip_assignments(argv)
     return os.path.basename(argv[0]) if argv else ""
 
 
@@ -117,18 +133,62 @@ def is_noisy_segment(prog, argv):
 RAW_OVERRIDE_RE = re.compile(r"#\s*squire-raw:\s*(?P<reason>.+)")
 RAW_OVERRIDE_LEDGER = os.path.expanduser("~/.squire/raw_overrides.jsonl")
 
+# 2026-09-18 fix (TODO "squire raw-override log records false overrides"): the ledger was
+# recording rows whose "reason" was literal TEMPLATE text -- `<reason>`, "marker", "escape
+# hatch ..." -- lifted from a command that only MENTIONED the marker (e.g. a heredoc `git commit
+# -m "$(cat <<'EOF' ... # squire-raw: <reason> ... EOF)"` -- this repo's own documented commit
+# convention -- or a quoted string like `echo "docs say # squire-raw: <reason>"`). A real
+# override is an actual unquoted shell comment on the executed command line, never text inside a
+# quoted argument or a heredoc body, and never the placeholder text itself.
+_HEREDOC_BODY_RE = re.compile(
+    r"<<[-~]?\s*['\"]?(?P<delim>\w+)['\"]?[^\n]*\n(?P<body>.*?)\n[ \t]*(?P=delim)\b",
+    re.DOTALL,
+)
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_PLACEHOLDER_REASONS = {"<reason>", "reason", "marker", "escape hatch"}
+
+
+def _looks_like_placeholder(reason):
+    r = reason.strip().rstrip(".").lower()
+    if not r:
+        return True
+    if r in _PLACEHOLDER_REASONS:
+        return True
+    if r.startswith("<") and r.endswith(">"):
+        return True
+    if r.startswith("escape hatch"):
+        return True
+    return False
+
+
+def _strip_non_executed_text(command):
+    """Remove heredoc bodies, then quoted string contents, so only text that is actually an
+    unquoted, executed part of the command line remains to be searched for the marker."""
+    stripped = _HEREDOC_BODY_RE.sub("", command)
+    return _QUOTED_RE.sub("", stripped)
+
 
 def find_raw_override(command):
-    m = RAW_OVERRIDE_RE.search(command or "")
-    return m.group("reason").strip() if m else None
+    if not command:
+        return None
+    m = RAW_OVERRIDE_RE.search(_strip_non_executed_text(command))
+    if not m:
+        return None
+    reason = m.group("reason").strip()
+    if _looks_like_placeholder(reason):
+        return None
+    return reason
 
 
 def log_raw_override(payload, tool_name, command, reason):
     try:
         os.makedirs(os.path.dirname(RAW_OVERRIDE_LEDGER), exist_ok=True)
+        payload = payload or {}
         row = {
             "ts": time.time(),
-            "session": (payload or {}).get("session_id", "unknown"),
+            "session": payload.get("session_id", "unknown"),
+            "agent_id": payload.get("agent_id"),
+            "agent_type": payload.get("agent_type"),
             "tool": tool_name,
             "reason": reason,
             "cmd_head": (command or "")[:80],
@@ -137,6 +197,52 @@ def log_raw_override(payload, tool_name, command, reason):
             fh.write(json.dumps(row) + "\n")
     except OSError:
         pass
+
+
+# Best-effort "repeated small raw grep" nudge (2026-09-18): search_guard.py already DENIES a
+# broad sweep (grep -r/-R, rg, find|xargs grep); this handles the narrower case it deliberately
+# allows -- a single, non-recursive `grep <pattern> <file>` -- which is fine once or twice but a
+# sign the session should reach for `squire grep` once it keeps happening. Tracked per session_id
+# in a small JSON file under ~/.squire/ (created if missing) with timestamps pruned to a short
+# window; crossing the threshold adds `additionalContext` (never a deny -- this is a nudge, not
+# a gate) suggesting `squire grep`. Any I/O failure here just means no nudge fires (fail open,
+# same as the rest of this hook); it never blocks the underlying grep call.
+GREP_NUDGE_STATE = os.path.expanduser(os.environ.get("SQUIRE_GREP_NUDGE_STATE", "~/.squire/grep_nudge_state.json"))
+GREP_NUDGE_WINDOW_S = float(os.environ.get("SQUIRE_GREP_NUDGE_WINDOW_S", "300"))
+GREP_NUDGE_THRESHOLD = int(os.environ.get("SQUIRE_GREP_NUDGE_THRESHOLD", "3"))
+
+
+def has_raw_grep_segment(segments):
+    return any(program_name(argv) == "grep" for _op, argv in segments)
+
+
+def record_grep_call(session_id, now=None):
+    """Append `now` to this session's raw-grep timestamp list, pruned to GREP_NUDGE_WINDOW_S,
+    and return the resulting count. Pure function of (state, now) apart from the file I/O, so
+    the counting logic itself is unit-testable without touching disk (see test_pretool_wrap.py)."""
+    now = now if now is not None else time.time()
+    try:
+        os.makedirs(os.path.dirname(GREP_NUDGE_STATE), exist_ok=True)
+        try:
+            with open(GREP_NUDGE_STATE, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, ValueError):
+            state = {}
+        times = [t for t in state.get(session_id, []) if now - t < GREP_NUDGE_WINDOW_S]
+        times.append(now)
+        state[session_id] = times
+        with open(GREP_NUDGE_STATE, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        return len(times)
+    except OSError:
+        return 0
+
+
+def prune_and_count(timestamps, now, window_s=GREP_NUDGE_WINDOW_S):
+    """The counting rule in isolation, no I/O: how many of `timestamps` (plus `now` itself) fall
+    within `window_s` seconds of `now`. Exposed separately so the logic can be tested without a
+    state file."""
+    return len([t for t in timestamps if now - t < window_s]) + 1
 
 
 def find_squire_bin():
@@ -165,6 +271,14 @@ def should_wrap(command):
     if not segments:
         return False
 
+    # NEVER_WRAP_PROGRAMS still vetoes the WHOLE pipeline the instant any segment runs one --
+    # unchanged, deliberate behavior (see test_session_claim_is_never_wrapped): a gate command
+    # like `session-claim check . && pytest -q` must never have its exit-code-critical output
+    # folded into squire's condensed run, even when a noisy command follows it. Only the
+    # argv[0]/assignment-word detection below is the 2026-09-18 fix (TODO "squire pretool_wrap
+    # misses commands after a VAR= assignment"): program_name() now skips leading NAME=value
+    # env-prefix words, so `FOO=1 pytest` and a `;`-separated `D=x; flatpak-spawn ...` are
+    # correctly recognized as noisy on the REAL command word, not on the assignment token.
     noisy_found = False
     for op, argv in segments:
         prog = program_name(argv)
@@ -172,17 +286,29 @@ def should_wrap(command):
             return False
         if op == "|" and prog in PIPE_TRIM_PROGRAMS:
             return False
-        if is_noisy_segment(prog, argv):
+        if is_noisy_segment(prog, strip_assignments(argv)):
             noisy_found = True
     return noisy_found
 
 
-def build_wrapped_command(original):
+def build_wrapped_command(original, agent_id=None, agent_type=None):
     squire_argv = find_squire_bin()
     # squire_argv is e.g. ["squire"] or [sys.executable, ".../squire.py"]; render as a single
     # shell-safe command string since Bash tool_input.command is one string executed with shell=True.
     quoted_squire = " ".join(shlex.quote(a) for a in squire_argv)
-    return f"{quoted_squire} run -- bash -c {shlex.quote(original)}"
+    # agent_id/agent_type (2026-09-18, TODO "usage report can't attribute per agent"): the
+    # harness does not export these as env vars on its own -- PreToolUse stdin carries them only
+    # inside a subagent (verified against https://code.claude.com/docs/en/hooks), so this hook
+    # forwards them as env-var prefixes on the wrapped command. squire.py's log_call() reads
+    # SQUIRE_AGENT_ID/SQUIRE_AGENT_TYPE and records them on the ledger row. Omitted entirely on
+    # the main thread (both None), so a ledger row's absence of these fields still means "main
+    # thread", not "not recorded".
+    env_prefix = ""
+    if agent_id:
+        env_prefix += f"SQUIRE_AGENT_ID={shlex.quote(str(agent_id))} "
+    if agent_type:
+        env_prefix += f"SQUIRE_AGENT_TYPE={shlex.quote(str(agent_type))} "
+    return f"{env_prefix}{quoted_squire} run -- bash -c {shlex.quote(original)}"
 
 
 def main():
@@ -205,9 +331,31 @@ def main():
         return 0
 
     if not should_wrap(command):
+        # Not a noisy command to wrap -- but if it's a raw `grep` (the single-file case
+        # search_guard deliberately allows), count it and nudge once the session leans on it.
+        try:
+            segments = tokenize_pipeline(command)
+        except ValueError:
+            segments = []
+        if has_raw_grep_segment(segments):
+            session_id = payload.get("session_id", "unknown")
+            count = record_grep_call(session_id)
+            if count >= GREP_NUDGE_THRESHOLD:
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "additionalContext": (
+                            f"{count} raw grep calls in the last {int(GREP_NUDGE_WINDOW_S)}s -- "
+                            "consider `squire grep \"<question>\" [path]` for the rest of this search."
+                        ),
+                    }
+                }))
         return 0
 
-    new_command = build_wrapped_command(command)
+    new_command = build_wrapped_command(
+        command, agent_id=payload.get("agent_id"), agent_type=payload.get("agent_type")
+    )
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

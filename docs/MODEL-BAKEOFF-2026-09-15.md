@@ -1,6 +1,6 @@
 # Model bake-off: does a newer open model beat qwen2.5:14b on this 3090? (2026-09-15)
 
-Owner-approved research + bake-off. Question: does any newer open-weight instruct model, at a
+Research bake-off. Question: does any newer open-weight instruct model, at a
 quant that fits the RTX 3090's 24 GB, run squire's actual job (condense test output/logs/diffs,
 answer strictly from given text, say UNKNOWN when absent, never invent names) better than the
 current default, measured on `eval/run_eval.py`.
@@ -75,7 +75,7 @@ tied or slightly behind here could look different on the full 50-case corpus beh
 `docs/BENCHMARK.md`, or with `qwen3:14b`'s non-thinking variant/tag, or with more repeats to
 account for the run-to-run variance observed even on the current default.
 
-## Section 2 (2026-09-15, decisive pass) — full n=50 corpus, ≥3 passes, owner-approved bake-off
+## Section 2 (2026-09-15, decisive pass) — full n=50 corpus, ≥3 passes
 
 **Decision rule, stated before looking at results:** switch the default only if a candidate has
 mean recall ≥ the default's, zero invented names, false-clean no worse, p95 latency ≤ 1.5× the

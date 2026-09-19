@@ -134,9 +134,10 @@ squire doctor
 Tested: exit 0, `[squire] READY`, backend and model both confirmed reachable. `squire doctor
 --json` also exit 0 with `"ready": true` for scripting.
 
-**Not yet available:** PyPI publication (`pipx install squire-offload` once published — pending
-owner approval, outward-facing) and a zipapp attached to a tagged release (no release exists
-yet). Don't follow either until this section is updated to say they're live.
+**Not yet available:** PyPI publication (`pipx install squire-offload` once published) and a
+zipapp attached to a tagged release. GitHub releases with source archives exist; see
+[Releases](https://github.com/jsonholdings/squire/releases) for the current version. Don't
+follow either unavailable path until this section is updated to say they're live.
 
 ## Quickstart
 
@@ -165,7 +166,7 @@ All commands below are implemented in `squire.py` (verified via `squire --help`,
 | `squire ask "question" [file\|-]` | Answers strictly from the given text; says `UNKNOWN` if the answer isn't in it. |
 | `squire draft "instructions" [file\|-]` | Produces a first draft for a human/Claude to review and correct — never used as-is. |
 | `squire diff [--staged] \| squire diff <ref1> <ref2>` | Always prints the real `git diff --stat` line first, then a condensed summary separating logic changes from formatting/rename-only changes. Never used to decide whether a diff is safe to commit. |
-| `squire grep "query" [path] [--top N] [--reindex]` | Local semantic search over a repo using embeddings (`SQUIRE_EMBED_MODEL`, default `nomic-embed-text`), cached in `<repo>/.squire-cache/` (added to `.git/info/exclude`, never `.gitignore`). Always prints how many files/chunks were indexed. VERIFIED (this session, 55-file repo): cold index 2.9s for 32 chunks; a separate run measured 43s cold / 8.7s warm on a 143-chunk repo (re-run on your own repo to confirm). |
+| `squire grep "query" [path] [--top N] [--reindex]` | Local semantic search over a repo using embeddings (`SQUIRE_EMBED_MODEL`, default `nomic-embed-text`), cached in `<repo>/.squire-cache/` (added to `.git/info/exclude`, never `.gitignore`). Always prints how many files/chunks were indexed. Measured (55-file repo): cold index 2.9s for 32 chunks; a separate run measured 43s cold / 8.7s warm on a 143-chunk repo (re-run on your own repo to confirm). |
 | `squire triage <file>` | Reorders a HANDOFF-INBOX/BACKLOG-shaped file oldest-open-first using a real, computed age, plus a one-line ASSUMED impact guess per item, visually separated from the computed part. |
 | `squire stats` | Reports real chars in/out from `~/.squire/ledger.jsonl`, plus a token estimate labelled ESTIMATE (chars/4 heuristic) — cross-check with `scripts/squire_report.py` before citing a token figure. |
 | `squire doctor [--json]` | Checks backend reachability and model availability. Exit 0 = ready, 2 = `UNKNOWN`. |
@@ -264,14 +265,11 @@ Exit-code fidelity is measured separately, on a deterministic fixture corpus, no
 bootstrap 95% CI, resumable) covering token savings, exit-code fidelity, and failing-test-name
 recall. Full method, corpus and limitations: [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
 
-**Headline (2026-09-13, RTX 3090 + qwen2.5:14b, real concurrent load present on the host).**
-**Corrected 2026-09-13 (S8c):** the previous headline pooled two very different workload types
-(whole-file summarization, which compresses to near-100% by construction, and live noisy-command
-wrapping) into one median. Because the two groups have nearly equal sample sizes but very
-different savings, the pooled median sat at the boundary between them and read as ~93% —
-overstating what a typical noisy command sees. The two are now reported separately, and every
-number carries n and a named 95% CI (bootstrap for medians/means, Wilson score interval for
-pass/fail proportions):
+**Headline (RTX 3090 + qwen2.5:14b, real concurrent load present on the host).** Whole-file
+summarization (which compresses to near-100% by construction) and live noisy-command wrapping
+are two very different workload types with very different savings, so they are reported
+separately rather than pooled into one median. Every number carries n and a named 95% CI
+(bootstrap for medians/means, Wilson score interval for pass/fail proportions):
 
 | Metric | Value | n | 95% CI | Note |
 |---|---|---|---|---|
@@ -300,7 +298,7 @@ isolated-hardware numbers; token savings depend on workload verbosity and will v
 ## Accuracy eval
 
 `eval/run_eval.py` scores `squire run`'s failure summaries against 8 ground-truth fixtures
-(pytest/jest/go/cargo/build-error, clean and failing). VERIFIED, this session, live against the
+(pytest/jest/go/cargo/build-error, clean and failing). Measured live against the
 local backend: mean recall 1.000, 0 false-clean claims. Exit 2 (never pass/fail) if the backend is
 unreachable — see `eval/run_eval.py` docstring.
 

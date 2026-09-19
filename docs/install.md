@@ -9,12 +9,13 @@ ln -s "$(pwd)/squire.py" ~/bin/squire   # optional: put it on PATH
 Requires only Python 3 stdlib and a running local backend (see [backends.md](backends.md)).
 
 ## pipx
-Wheel packaging is built (VERIFIED via the project's packaging tooling). Once published to PyPI:
-`pipx install squire-cli`. Publication itself is pending owner approval (outward-facing action).
+The package (`squire-offload`) is not on PyPI. Install it from GitHub:
+`pipx install "squire-offload @ git+https://github.com/jsonholdings/squire.git"`.
 
 ## Single-file zipapp
-Built via `pyproject.toml`'s packaging: `python3 squire.pyz --help`, no install step. Attached to
-each tagged GitHub release once one exists.
+Built via `pyproject.toml`'s packaging: `python3 squire.pyz --help`, no install step. GitHub
+releases exist (see [Releases](https://github.com/jsonholdings/squire/releases)); the zipapp is
+not yet attached as a release asset.
 
 ## Docker
 ```sh

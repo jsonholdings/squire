@@ -160,6 +160,98 @@ def test_diff_shows_real_stat_even_when_model_is_down(tmp_path):
     assert "UNKNOWN" in p.stdout  # backend down is reported, never silent
 
 
+def test_diff_binary_only_staged_set_never_hangs(tmp_path):
+    # 2026-09-18: `squire diff --staged` hung (>7min, then >90s) on a staged set of regenerated
+    # PNG/PDF files. git renders a changed binary file as a one-line "Binary files ... differ"
+    # marker on its own, so this is the control proving the ordinary binary-only case is fast and
+    # never even reaches the byte cap or the hard timeout below.
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "commit", "-q", "--allow-empty", "-m", "init")
+    (tmp_path / "a.png").write_bytes(os.urandom(3 * 1024 * 1024))
+    (tmp_path / "b.pdf").write_bytes(os.urandom(2 * 1024 * 1024))
+    git(tmp_path, "add", "a.png", "b.pdf")
+    start = time.monotonic()
+    p = subprocess.run([sys.executable, str(SQUIRE), "diff", "--staged", "--json"], cwd=tmp_path,
+                       text=True, capture_output=True, env=DOWN, timeout=30)
+    elapsed = time.monotonic() - start
+    assert elapsed < 15  # generous; real hangs were 90s-7min
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert out["exit_code"] == 0
+    assert "a.png" in out["raw_tail"] and "b.pdf" in out["raw_tail"]  # real --stat always shown
+    assert out["summary"].startswith("UNKNOWN:")  # backend down, reported not silent
+
+
+def test_diff_mixed_binary_and_text_staged_set_never_hangs(tmp_path):
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "commit", "-q", "--allow-empty", "-m", "init")
+    (tmp_path / "img.png").write_bytes(os.urandom(2 * 1024 * 1024))
+    (tmp_path / "notes.txt").write_text("hello\nworld\n")
+    git(tmp_path, "add", "img.png", "notes.txt")
+    start = time.monotonic()
+    p = subprocess.run([sys.executable, str(SQUIRE), "diff", "--staged", "--json"], cwd=tmp_path,
+                       text=True, capture_output=True, env=DOWN, timeout=30)
+    elapsed = time.monotonic() - start
+    assert elapsed < 15
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert "img.png" in out["raw_tail"] and "notes.txt" in out["raw_tail"]
+
+
+def test_diff_huge_text_file_staged_set_never_hangs(tmp_path):
+    # The actual root cause: a regenerated binary file that git's own heuristic does NOT flag as
+    # binary (no NUL byte in git's scan window) is diffed as TEXT -- reproduced here with a file
+    # whose first ~8KB has no NUL byte followed by random bytes. Verified locally this produces a
+    # multi-MB `git diff` (6.3MB in the original repro). DIFF_MAX_CONDENSE_BYTES must cap what's
+    # sent to the model regardless of git's binary detection.
+    git(tmp_path, "init", "-q")
+    header = (b"A" * 60 + b"\n") * 140  # ~8400 bytes, no NUL -> git treats the file as text
+    (tmp_path / "gen.pdf").write_bytes(header + os.urandom(2 * 1024 * 1024))
+    git(tmp_path, "add", "gen.pdf")
+    git(tmp_path, "commit", "-q", "-m", "init")
+    header2 = (b"B" * 60 + b"\n") * 140
+    (tmp_path / "gen.pdf").write_bytes(header2 + os.urandom(2 * 1024 * 1024))
+    git(tmp_path, "add", "gen.pdf")
+    numstat = subprocess.run(["git", "-C", str(tmp_path), "diff", "--staged", "--numstat"],
+                             capture_output=True, text=True).stdout
+    assert "-\t-\t" not in numstat  # control: confirm git really did NOT flag this as binary
+    start = time.monotonic()
+    p = subprocess.run([sys.executable, str(SQUIRE), "diff", "--staged", "--json"], cwd=tmp_path,
+                       text=True, capture_output=True, env=DOWN, timeout=30)
+    elapsed = time.monotonic() - start
+    assert elapsed < 15  # DOWN backend fails the connection instantly; this proves the CAP, not
+                          # the hard timeout (see test_diff_summary_hard_timeout_falls_back below)
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert "gen.pdf" in out["raw_tail"]
+
+
+def test_diff_summary_hard_timeout_falls_back(tmp_path, fake_ollama, monkeypatch):
+    # A responsive-but-slow backend (queued behind other work, or a huge prompt) must never hang
+    # this command past DIFF_SUMMARY_TIMEOUT_S -- past the deadline it returns the real --stat
+    # plus a visible UNKNOWN, with exit code 0 (diff succeeded; only summarisation timed out).
+    url, handler = fake_ollama
+    handler.delay_s = 5.0
+    git(tmp_path, "init", "-q")
+    (tmp_path / "f.txt").write_text("a\n")
+    git(tmp_path, "add", "f.txt")
+    git(tmp_path, "commit", "-q", "-m", "init")
+    (tmp_path / "f.txt").write_text("a\nb\n")
+    git(tmp_path, "add", "f.txt")
+    env = {**os.environ, "SQUIRE_OLLAMA": url, "SQUIRE_LLM_LOCK": DOWN["SQUIRE_LLM_LOCK"],
+           "SQUIRE_DIFF_SUMMARY_TIMEOUT": "1"}
+    start = time.monotonic()
+    p = subprocess.run([sys.executable, str(SQUIRE), "diff", "--staged", "--json"], cwd=tmp_path,
+                       text=True, capture_output=True, env=env, timeout=30)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5  # the backend takes 5s per call; a 1s timeout must win
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert "f.txt" in out["raw_tail"]  # real --stat always shown
+    assert "summary timed out" in out["summary"]
+    assert out["backend_ok"] is False
+
+
 def test_stats_reports_real_chars_and_labels_estimate_separately(tmp_path):
     ledger = tmp_path / "ledger.jsonl"
     ledger.write_text('{"ts": 1, "cmd": "sum", "chars_in": 100, "chars_out": 20, "backend_ok": true}\n')
@@ -361,6 +453,32 @@ def test_triage_orders_by_real_age_and_skips_done(tmp_path):
     assert len(titles) == 2 and "older" in titles[0] and "newer" in titles[1]
     assert obj["backend_ok"] is False and all(i["guess"] is None for i in obj["open_items"])
     assert obj["open_items"][0]["age_days"] > obj["open_items"][1]["age_days"]
+
+
+def test_triage_parses_checklist_items_not_just_headings(tmp_path):
+    # TODO-*.md format: `## Section` followed by `- [ ] **Title** ...date... description`
+    # checklist items, no `## [STATUS]` heading per item. Triage must not silently see 0 items.
+    f = tmp_path / "TODO-2026-09-12.md"
+    f.write_text(
+        "# TODO\n\n"
+        "## HUMAN — ordered by what it unblocks\n\n"
+        "- [ ] **SECURITY (found 2026-09-15): this workstation has NO host firewall.**\n"
+        "  Continuation text on the next line, still part of the same item.\n"
+        "- [x] **Old resolved item** done on 2026-09-01, should be excluded like DONE headings.\n"
+        "\n## CLAUDE\n\n"
+        "- [ ] **Second section item** dated 2026-09-01 for aging.\n"
+    )
+    import json as _j
+    p = run("triage", str(f), "--json")
+    obj = _j.loads(p.stdout)
+    item_kind = [i for i in obj["open_items"] if i["kind"] == "item"]
+    titles = [i["heading"] for i in item_kind]
+    # the [x] checklist item is excluded like a DONE heading would be; a heading-only parser
+    # would have found 0 checklist items regardless of how many `##` headings exist.
+    assert len(titles) == 2
+    assert any("SECURITY" in t for t in titles)
+    assert any("Second section item" in t for t in titles)
+    assert {i["section"] for i in item_kind} == {"HUMAN — ordered by what it unblocks", "CLAUDE"}
 
 
 def test_grep_backend_down_is_unknown_exit_2_and_reports_coverage(tmp_path):
@@ -566,6 +684,30 @@ def test_ledger_records_session_id(tmp_path):
     run("sum", "-", stdin="x\n", env=env)
     import json as _j
     assert _j.loads(ledger.read_text().splitlines()[0])["session"] == "abc123"
+
+
+def test_ledger_records_agent_id_and_type_when_set(tmp_path):
+    # 2026-09-18 fix (TODO "squire usage report can't attribute per agent"): hooks/pretool_wrap.py
+    # forwards these as env vars on the wrapped command; log_call() must record them so
+    # hooks/usage_report.py can group by agent.
+    ledger = tmp_path / "l.jsonl"
+    env = {**DOWN, "SQUIRE_LEDGER": str(ledger), "CLAUDE_CODE_SESSION_ID": "abc123",
+           "SQUIRE_AGENT_ID": "agent-42", "SQUIRE_AGENT_TYPE": "worker"}
+    run("sum", "-", stdin="x\n", env=env)
+    import json as _j
+    row = _j.loads(ledger.read_text().splitlines()[0])
+    assert row["agent_id"] == "agent-42"
+    assert row["agent_type"] == "worker"
+
+
+def test_ledger_agent_fields_absent_are_none(tmp_path):
+    ledger = tmp_path / "l.jsonl"
+    env = {**DOWN, "SQUIRE_LEDGER": str(ledger), "CLAUDE_CODE_SESSION_ID": "abc123"}
+    run("sum", "-", stdin="x\n", env=env)
+    import json as _j
+    row = _j.loads(ledger.read_text().splitlines()[0])
+    assert row["agent_id"] is None
+    assert row["agent_type"] is None
 
 
 # ---- S4: ledger test isolation + source field ----
@@ -866,3 +1008,23 @@ def test_add_line_numbers_matches_source_lines():
     lines = numbered.splitlines()
     assert lines[0].endswith(": first") and lines[0].strip().startswith("1")
     assert lines[2].endswith(": third") and lines[2].strip().startswith("3")
+
+
+def test_doctor_reports_paused_and_exits_2_while_flag_is_set(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sq, "installed_models", lambda: ["qwen2.5:14b", "nomic-embed-text:latest"])
+    monkeypatch.setattr(sq, "gpu_free_mib", lambda: 20000)
+    monkeypatch.setattr(sq, "MODEL", "qwen2.5:14b")
+    flag = tmp_path / "gpu-paused.json"
+    monkeypatch.setattr(sq, "GPU_PAUSE_FLAG", str(flag))
+
+    # control: no flag -> READY, exit 0
+    with pytest.raises(SystemExit) as ok:
+        sq.cmd_doctor([])
+    assert ok.value.code == 0 and "PAUSED" not in capsys.readouterr().out
+
+    flag.write_text(json.dumps({"owner": "wilbur testing"}))
+    with pytest.raises(SystemExit) as paused:
+        sq.cmd_doctor([])
+    out = capsys.readouterr().out
+    assert paused.value.code == 2
+    assert "PAUSED: GPU held by wilbur testing" in out and "NOT READY" in out

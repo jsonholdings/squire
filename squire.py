@@ -34,7 +34,7 @@ Rules built in:
 - Secret-shaped strings are redacted before any text is sent to the backend.
 - Stdlib only.
 """
-__version__ = "0.2.29"
+__version__ = "0.2.35"
 
 import datetime as _dt
 import fcntl
@@ -214,10 +214,19 @@ def log_call(cmd, chars_in, chars_out, backend_ok, queue_wait_s=None, gen_s=None
     # triage that already equals chars_in (the real raw output/file/diff text), so it defaults
     # to chars_in when the caller doesn't pass a different counterfactual. Only `grep` passes an
     # explicit, smaller value (see cmd_grep).
+    # agent_id/agent_type (2026-09-18): PreToolUse hook payloads carry these fields ONLY when
+    # the tool call happens inside a subagent (verified against
+    # https://code.claude.com/docs/en/hooks) -- the harness does not export them as env vars on
+    # its own, so pretool_wrap.py/search_guard.py inject SQUIRE_AGENT_ID/SQUIRE_AGENT_TYPE into
+    # the wrapped command's environment when it rewrites a Bash call. Absent for the main thread
+    # and for any call not routed through a squire-wrapping hook -- both read as None, never
+    # coerced to a fake "main" sentinel here (that belongs in the report layer, which can tell
+    # "no agent" from "not recorded").
     row = {"ts": time.time(), "cmd": cmd, "chars_in": chars_in, "chars_out": chars_out,
            "chars_avoided_ESTIMATE": chars_in if chars_avoided is None else chars_avoided,
            "backend_ok": backend_ok, "queue_wait_s": queue_wait_s, "gen_s": gen_s,
            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "source": source or SOURCE,
+           "agent_id": os.environ.get("SQUIRE_AGENT_ID"), "agent_type": os.environ.get("SQUIRE_AGENT_TYPE"),
            "status": status, "exit_code": exit_code, "duration_s": duration_s}
     # `passthrough` (2026-09-15): a short `squire run` shown raw with no model call. Logged so real
     # usage is counted; it saved nothing, so every savings total excludes it.
@@ -330,7 +339,7 @@ def pick_model(installed, free_mib):
 
 _resolved_model = None
 
-GPU_PAUSE_FLAG = os.path.expanduser("~/.squire/gpu-paused.json")
+GPU_PAUSE_FLAG = os.environ.get("SQUIRE_GPU_PAUSE_FLAG") or os.path.expanduser("~/.squire/gpu-paused.json")
 
 
 def _docker_pid_alive(pid):
@@ -753,6 +762,81 @@ def cmd_run(argv):
     sys.exit(p.returncode)
 
 
+# 2026-09-18: `squire diff --staged` hung (>7min, then >90s on a retry) on a staged set of
+# regenerated PNG/PDF files, and the commit gate expects this command before every commit -- a
+# hang pushes agents to skip the gate (`git diff --staged --stat` was used instead, undogfooded).
+# Root cause: `git diff --staged` with no pathspec includes every changed file, and this command
+# fed that WHOLE text to the model with no regard for how many files were binary or how large the
+# diff was. `git diff` reliably renders a changed binary file as a one-line "Binary files a/x and
+# b/x differ" marker (verified: 3MB PNG + 2MB PDF staged locally still produced a 470-byte diff),
+# so raw byte count wasn't the smoking gun by itself -- but nothing here bounded either the
+# per-file content sent for condensation or the WALL-CLOCK time the model call could take, so any
+# combination of many changed files (binary or not) queued up an unbounded number of sequential
+# `llm()` calls in `_condense_core`'s chunk loop with only the 600s-per-call cap as a backstop.
+# Three independent guards now apply: (1) binary files are identified via `--numstat` (which
+# prints "-\t-\t<path>" for a binary file) and their content is NEVER sent to the model, only a
+# "Binary file changed: <path>" placeholder -- the diff sent for summarisation is built from
+# `git diff --staged -- <text files>` only; (2) the text sent to the model is capped at
+# DIFF_MAX_CONDENSE_BYTES, truncated with a visible note past that so a huge text-only diff can't
+# reproduce the same failure; (3) a hard wall-clock timeout (DIFF_SUMMARY_TIMEOUT_S) wraps the
+# whole condense_verified() call in a daemon thread -- past the deadline this returns the real
+# `--stat` plus "UNKNOWN: summary timed out (Ns)" instead of hanging, and the exit code stays 0
+# (diff succeeded; only the summarisation timed out) so a caller relying on the exit code is never
+# misled. The stray background thread is a daemon and is abandoned, not killed -- Python has no
+# way to kill a thread blocked in a socket read, and the process is about to exit anyway.
+DIFF_MAX_CONDENSE_BYTES = int(os.environ.get("SQUIRE_DIFF_MAX_BYTES", "200000"))
+DIFF_SUMMARY_TIMEOUT_S = float(os.environ.get("SQUIRE_DIFF_SUMMARY_TIMEOUT", "90"))
+
+
+def _diff_binary_paths(gitcmd):
+    """Paths git reports as binary for this diff, via --numstat ('-\t-\t<path>' for binary)."""
+    p = subprocess.run(gitcmd + ["--numstat"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, errors="replace")
+    paths = []
+    for line in (p.stdout or "").splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0] == "-" and parts[1] == "-":
+            paths.append(parts[2])
+    return paths
+
+
+def _condense_input_for_diff(gitcmd, binary_paths):
+    """Build the text handed to the model: real diff hunks for text files, a one-line placeholder
+    per binary file -- binary content is never sent for summarisation, whatever git's own binary
+    detection did or didn't do for it. Capped at DIFF_MAX_CONDENSE_BYTES so a huge text-only diff
+    can't reproduce the same unbounded-chunk-loop failure."""
+    pathspec_cmd = gitcmd + ["--"] + [":(exclude)" + b for b in binary_paths] if binary_paths else gitcmd
+    p = subprocess.run(pathspec_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, errors="replace")
+    if p.returncode == 0:
+        text_diff = p.stdout or ""
+    binary_note = "\n".join(f"Binary file changed: {path}" for path in binary_paths)
+    combined = "\n".join(x for x in (text_diff, binary_note) if x)
+    if len(combined) > DIFF_MAX_CONDENSE_BYTES:
+        combined = combined[:DIFF_MAX_CONDENSE_BYTES] + \
+            f"\n\n[squire] truncated at {DIFF_MAX_CONDENSE_BYTES} bytes ({len(combined)} total)"
+    return combined
+
+
+def _condense_verified_with_timeout(text, task, timeout_s):
+    """condense_verified() under a hard wall-clock deadline. Runs in a daemon thread so a stuck
+    HTTP call (past even the model's own per-call timeout, or queued behind another caller) can
+    never hang this command past `timeout_s` -- past the deadline this returns
+    ("UNKNOWN: summary timed out (Ns)", None) and abandons the thread; there is no way to kill a
+    thread blocked in a socket read, and the CLI process is about to print --stat and exit anyway."""
+    result = {}
+
+    def _run():
+        result["value"] = condense_verified(text, task)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        return f"UNKNOWN: summary timed out ({timeout_s:.0f}s)", None
+    return result.get("value", (f"UNKNOWN: summary thread produced no result", None))
+
+
 def cmd_diff(argv):
     json_mode, argv = pop_flag(argv, "--json")
     if argv and argv[0] == "--staged":
@@ -772,11 +856,15 @@ def cmd_diff(argv):
         emit("diff", 0, "(no diff)", None, True, json_mode)
         return
     reset_call_timing()
-    summary, flag = condense_verified(diff_text, "Summarize this git diff by file/module. Separate logic changes "
-                                      "from formatting/rename-only changes. Be factual, keep exact file paths and names.")
+    binary_paths = _diff_binary_paths(gitcmd)
+    condense_input = _condense_input_for_diff(gitcmd, binary_paths)
+    summary, flag = _condense_verified_with_timeout(
+        condense_input, "Summarize this git diff by file/module. Separate logic changes "
+        "from formatting/rename-only changes. Be factual, keep exact file paths and names.",
+        DIFF_SUMMARY_TIMEOUT_S)
     ok = not summary.startswith("UNKNOWN:")
     wait_s, gen_s = get_call_timing()
-    log_call("diff", len(diff_text), len(summary), ok, wait_s, gen_s,
+    log_call("diff", len(condense_input), len(summary), ok, wait_s, gen_s,
               status=None if ok else _unknown_reason(summary))
     if not json_mode:
         print(f"[squire] {stat.splitlines()[-1] if stat else '(no stat)'}")
@@ -1072,18 +1160,38 @@ def cmd_grep(argv):
 
 HEAD_RE = re.compile(r"^##\s+(?:\[(?P<status>[A-Z]+)[^\]]*\]\s*)?(?P<rest>.*)$")
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:?\d{2}|Z)?)?")
+# `- [ ] **Title** ...` / `- [x] ...` top-level checklist items -- the format TODO-*.md files use
+# instead of (or alongside) `## [STATUS]` headings. Only unindented items count as their own
+# triage-able entries; a nested/indented `  - [ ]` sub-bullet stays part of the parent item's body.
+ITEM_RE = re.compile(r"^-\s*\[(?P<mark>[ xX])\]\s*(?P<rest>.*)$")
+BOLD_RE = re.compile(r"\*\*(?P<title>[^*]+)\*\*")
 
 
 def parse_items(text):
-    items, cur = [], None
+    items, cur, section = [], None, None
     for line in text.splitlines():
         m = HEAD_RE.match(line)
         if m:
-            cur = {"status": (m.group("status") or "OPEN"), "heading": line[2:].strip(), "body": []}
+            cur = {"status": (m.group("status") or "OPEN"), "heading": line[2:].strip(), "body": [],
+                   "kind": "heading", "section": None}
             ts = TS_RE.search(line)
             cur["ts"] = ts.group(0) if ts else None
             items.append(cur)
-        elif cur is not None:
+            section = cur["heading"]
+            continue
+        im = ITEM_RE.match(line)
+        if im:
+            mark = im.group("mark")
+            status = "DONE" if mark.lower() == "x" else "OPEN"
+            rest = im.group("rest").strip()
+            bm = BOLD_RE.search(rest)
+            title = bm.group("title").strip() if bm else rest
+            ts = TS_RE.search(rest)
+            cur = {"status": status, "heading": title, "body": [rest], "kind": "item", "section": section}
+            cur["ts"] = ts.group(0) if ts else None
+            items.append(cur)
+            continue
+        if cur is not None:
             cur["body"].append(line)
     return items
 
@@ -1584,7 +1692,9 @@ def cmd_doctor(argv):
     has = lambda name: any(m == name or m.startswith(name + ":") or m.split(":")[0] == name for m in models)  # noqa: E731
     report["model_installed"] = bool(report["resolved_model"]) and has(report["resolved_model"])
     report["embed_installed"] = has(EMBED_MODEL)
-    ready = report["backend_ok"] and report["model_installed"]
+    paused_by = gpu_paused_by()
+    report["paused_by"] = paused_by
+    ready = report["backend_ok"] and report["model_installed"] and paused_by is None
     report["ready"] = ready
     if json_mode:
         print(json.dumps(report))
@@ -1597,6 +1707,8 @@ def cmd_doctor(argv):
             print(f"[squire] chat model {report['resolved_model']}: {'installed' if report['model_installed'] else 'MISSING'}")
             print(f"[squire] embed model {EMBED_MODEL}: {'installed' if report['embed_installed'] else 'MISSING (squire grep needs it)'}")
         print(f"[squire] GPU free: {str(free) + ' MiB' if free is not None else 'UNKNOWN (nvidia-smi not reachable)'}")
+        if paused_by:
+            print(f"[squire] PAUSED: GPU held by {paused_by}; model commands return UNKNOWN, `squire run` passthrough still works")
         print(f"[squire] {'READY' if ready else 'NOT READY'}")
     sys.exit(0 if ready else 2)
 

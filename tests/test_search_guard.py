@@ -196,3 +196,52 @@ def test_find_pipe_xargs_grep_still_denied_after_tokenization_fix():
     # `xargs`, which is "|"), so this case silently stopped denying. Locks in the fix.
     p = run_hook(bash_payload("find . -name '*.py' | xargs grep -l TODO"))
     assert decision(p) == "deny"
+
+
+# --- 2026-09-18 fixes -------------------------------------------------------
+
+def test_var_assignment_prefix_before_grep_dash_r_is_still_denied():
+    p = run_hook(bash_payload("FOO=1 grep -r foo ."))
+    assert p.returncode == 0
+    assert decision(p) == "deny"
+
+
+def test_raw_override_inside_quoted_commit_message_is_not_logged(tmp_path):
+    ledger = tmp_path / ".squire" / "raw_overrides.jsonl"
+    cmd = 'git commit -m "docs: mention # squire-raw: <reason>"; grep -r foo .'
+    p = run_hook(bash_payload(cmd), env_overrides={"HOME": str(tmp_path)})
+    assert p.returncode == 0
+    assert decision(p) == "deny"  # the real grep -r is still denied, not swallowed
+    assert not ledger.exists()
+
+
+def test_real_unquoted_raw_override_with_real_reason_is_still_logged_and_allowed(tmp_path):
+    ledger = tmp_path / ".squire" / "raw_overrides.jsonl"
+    cmd = "grep -r foo . # squire-raw: locked venv, need raw access"
+    p = run_hook(bash_payload(cmd), env_overrides={"HOME": str(tmp_path)})
+    assert p.returncode == 0
+    assert p.stdout.strip() == ""  # allowed through, no deny output
+    assert ledger.exists()
+    row = json.loads(ledger.read_text().strip().splitlines()[-1])
+    assert row["reason"] == "locked venv, need raw access"
+
+
+def test_placeholder_reason_alone_does_not_bypass_deny(tmp_path):
+    ledger = tmp_path / ".squire" / "raw_overrides.jsonl"
+    cmd = "grep -r foo . # squire-raw: <reason>"
+    p = run_hook(bash_payload(cmd), env_overrides={"HOME": str(tmp_path)})
+    assert p.returncode == 0
+    assert decision(p) == "deny"
+    assert not ledger.exists()
+
+
+def test_agent_fields_recorded_on_override_log(tmp_path):
+    ledger = tmp_path / ".squire" / "raw_overrides.jsonl"
+    payload = bash_payload("grep -r foo . # squire-raw: needed for a one-off audit")
+    payload["agent_id"] = "agent-9"
+    payload["agent_type"] = "worker"
+    p = run_hook(payload, env_overrides={"HOME": str(tmp_path)})
+    assert p.returncode == 0
+    row = json.loads(ledger.read_text().strip().splitlines()[-1])
+    assert row["agent_id"] == "agent-9"
+    assert row["agent_type"] == "worker"

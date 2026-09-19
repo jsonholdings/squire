@@ -155,5 +155,5 @@ overstates squire's share of total context. The data cannot currently tell which
   yet enforcing), AFTER = 09-14 onward (enforcement hooks live).
 - No charts in this pass; charting is `BACKLOG.md`'s separate, still-open item.
 - Every number above is either VERIFIED (computed directly from `message.usage` blocks or the
-  ledger, this session) or explicitly labelled ESTIMATED with its method. Nothing here is a
+  ledger) or explicitly labelled ESTIMATED with its method. Nothing here is a
   measured dollar figure or a measured percentage suitable for a public claim.

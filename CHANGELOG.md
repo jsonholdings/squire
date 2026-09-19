@@ -2,7 +2,77 @@
 All notable changes to Squire are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.2.35] - 2026-09-19
+
+### Added
+- `scripts/scrub_check.py` now also lints README.md and every `docs/**/*.md` file for internal
+  session-narration phrases ("VERIFIED this session", "Owner-approved", "Corrected YYYY-MM-DD")
+  that describe the writing process instead of the fact itself, so they can't ship in public
+  docs again.
+
+### Fixed
+- README.md and `docs/BENCHMARK.md`/`docs/MODEL-BAKEOFF-2026-09-15.md`/`docs/commands.md`/
+  `docs/install.md`/`docs/USAGE-ANALYSIS-2026-09-15.md` carried session-narration phrasing and
+  one false claim (README.md said no GitHub release existed; releases exist back to v0.2.5).
+  Reworded to plain present-tense fact; no measured numbers changed.
+- `docs/install.md` named a package (`squire-cli`) that does not exist; it now gives the real
+  package name, `squire-offload`, installed from GitHub (it is not on PyPI).
+
+## [0.2.34] - 2026-09-18
+
+### Fixed
+- `squire doctor` reported READY while the GPU pause flag was set; it now prints `PAUSED: GPU held by <owner>` and
+  exits 2 (not ready), with `paused_by` in `--json`.
+- The test suite read the live pause flag, so 9 tests failed whenever the GPU was paused. The flag path can now be
+  overridden with `SQUIRE_GPU_PAUSE_FLAG`, and the tests point it at an isolated path.
+
+## [0.2.33] - 2026-09-18
+
+### Fixed
+- `tests/test_pretool_wrap.py`: every hook run now gets its own grep-nudge state file. The shared
+  `~/.squire` state picked up real greps from live sessions, so `test_pipe_to_grep_is_not_wrapped` failed
+  depending on what else ran on the machine.
+
+## [0.2.32] - 2026-09-18
+### Fixed
+- `squire diff --staged` hung (reported: one run over 7 minutes, a retry over 90 seconds) on a
+  staged set of regenerated PNG/PDF files, pushing the commit gate to be skipped in favor of a
+  plain `git diff --staged --stat`. Root cause: a regenerated binary file whose content doesn't
+  trip git's own binary heuristic (no NUL byte in git's scan window) gets diffed as TEXT, and the
+  whole diff -- multi-megabyte in the reproduction -- was fed to the model with no size bound and
+  no wall-clock cap on the summarisation call. Three independent guards now apply: binary files
+  (via `git diff --numstat`) are excluded from the text sent to the model and replaced with a
+  one-line placeholder; the combined text sent for summarisation is capped at 200,000 bytes
+  (`SQUIRE_DIFF_MAX_BYTES`); and the whole summarisation call now runs under a 90s hard timeout
+  (`SQUIRE_DIFF_SUMMARY_TIMEOUT`), past which it returns the real `--stat` plus
+  `UNKNOWN: summary timed out (Ns)` with exit code 0, rather than hanging.
+
+## [0.2.31] - 2026-09-18
+### Fixed
+- `pretool_wrap.py`/`search_guard.py` didn't skip a leading `NAME=value` env-prefix word (or an
+  assignment as its own `;`-separated segment) when finding a segment's real program, so
+  `FOO=1 pytest` and similar never registered as noisy/deniable. Both hooks' `program_name()` now
+  strips leading assignment tokens before matching (`NEVER_WRAP_PROGRAMS`'s whole-pipeline veto is
+  unchanged -- a gate command like `session-claim check . && pytest -q` still blocks wrapping).
+- The `# squire-raw:` override ledger recorded false entries whose "reason" was literal template
+  text (`<reason>`, "marker", "escape hatch ...") lifted from a command that only MENTIONED the
+  marker -- inside a quoted argument or a heredoc body (including this repo's own documented
+  `git commit -m "$(cat <<'EOF' ...)"` convention). Both hooks now only recognize an unquoted,
+  non-heredoc marker with a non-placeholder reason.
+### Added
+- Ledger rows and the raw-override ledger now record `agent_id`/`agent_type` when a Bash call runs
+  inside a subagent (PreToolUse payload fields, forwarded by `pretool_wrap.py`/`search_guard.py` as
+  `SQUIRE_AGENT_ID`/`SQUIRE_AGENT_TYPE` env vars; read by `squire.py`'s `log_call()`). Every ledger
+  row previously shared one `session_id` across a session and all its subagents, so "which agent
+  skipped squire" was unanswerable. `hooks/usage_report.py --agents` adds a per-agent breakdown.
+
+## [0.2.30] - 2026-09-18
+### Fixed
+- `squire triage` only recognized `## [STATUS]` headings, so a TODO file using GitHub-style
+  `- [ ] **Title**` checklist items (no per-item heading) triaged as zero open items. It now also
+  parses top-level `- [ ]`/`- [x]` checklist lines as triage-able entries -- checkbox state maps to
+  OPEN/DONE, a bold title is captured when present, a date in the item text still drives real-age
+  sorting, and each item records the nearest preceding `##` heading as its section.
 
 ## [0.2.29] - 2026-09-15
 ### Added

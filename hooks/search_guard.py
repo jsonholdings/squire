@@ -74,7 +74,21 @@ def tokenize_pipeline(command):
     return segments
 
 
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_assignments(argv):
+    """Same fix as pretool_wrap.py's twin (2026-09-18, TODO "squire pretool_wrap misses
+    commands after a VAR= assignment", same tokenizer): skip leading NAME=value env-prefix
+    words so `FOO=1 grep -r x .` is recognized as `grep`, not as a non-match on `FOO=1`."""
+    i = 0
+    while i < len(argv) and ASSIGNMENT_RE.match(argv[i]):
+        i += 1
+    return argv[i:]
+
+
 def program_name(argv):
+    argv = strip_assignments(argv)
     return os.path.basename(argv[0]) if argv else ""
 
 
@@ -91,18 +105,58 @@ def analyze_grep_segment(argv):
     return has_r, is_single_file
 
 
+# 2026-09-18 fix (TODO "squire raw-override log records false overrides"), same rule as
+# pretool_wrap.py's twin, duplicated deliberately (see module docstring): a real override marker
+# is an unquoted, non-heredoc `# squire-raw: <real reason>` on the executed command line, never
+# text inside a quoted argument or heredoc body, and never the literal placeholder text.
+_HEREDOC_BODY_RE = re.compile(
+    r"<<[-~]?\s*['\"]?(?P<delim>\w+)['\"]?[^\n]*\n(?P<body>.*?)\n[ \t]*(?P=delim)\b",
+    re.DOTALL,
+)
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_PLACEHOLDER_REASONS = {"<reason>", "reason", "marker", "escape hatch"}
+
+
+def _looks_like_placeholder(reason):
+    r = reason.strip().rstrip(".").lower()
+    if not r:
+        return True
+    if r in _PLACEHOLDER_REASONS:
+        return True
+    if r.startswith("<") and r.endswith(">"):
+        return True
+    if r.startswith("escape hatch"):
+        return True
+    return False
+
+
+def _strip_non_executed_text(text):
+    stripped = _HEREDOC_BODY_RE.sub("", text)
+    return _QUOTED_RE.sub("", stripped)
+
+
 def find_raw_override(text):
-    m = RAW_OVERRIDE_RE.search(text or "")
-    return m.group("reason").strip() if m else None
+    if not text:
+        return None
+    m = RAW_OVERRIDE_RE.search(_strip_non_executed_text(text))
+    if not m:
+        return None
+    reason = m.group("reason").strip()
+    if _looks_like_placeholder(reason):
+        return None
+    return reason
 
 
 def log_override(payload, tool_name, cmd_or_pattern, reason):
     try:
         os.makedirs(os.path.dirname(RAW_OVERRIDE_LEDGER), exist_ok=True)
         import time
+        payload = payload or {}
         row = {
             "ts": time.time(),
-            "session": (payload or {}).get("session_id", "unknown"),
+            "session": payload.get("session_id", "unknown"),
+            "agent_id": payload.get("agent_id"),
+            "agent_type": payload.get("agent_type"),
             "tool": tool_name,
             "reason": reason,
             "cmd_head": (cmd_or_pattern or "")[:80],
@@ -145,16 +199,19 @@ def handle_bash(payload, command):
 
     is_sweep = False
     for i, (op, argv) in enumerate(segments):
-        prog = program_name(argv)
+        stripped = strip_assignments(argv)
+        prog = os.path.basename(stripped[0]) if stripped else ""
         if prog == "grep":
-            has_r, _is_single = analyze_grep_segment(argv)
+            has_r, _is_single = analyze_grep_segment(stripped)
             if has_r:
                 is_sweep = True
         elif prog == "rg":
             is_sweep = True
         elif prog == "xargs" and i > 0:
             _prev_op, prev_argv = segments[i - 1]
-            if op == "|" and program_name(prev_argv) == "find" and "grep" in argv[1:]:
+            prev_stripped = strip_assignments(prev_argv)
+            prev_prog = os.path.basename(prev_stripped[0]) if prev_stripped else ""
+            if op == "|" and prev_prog == "find" and "grep" in stripped[1:]:
                 is_sweep = True
 
     if not is_sweep:
